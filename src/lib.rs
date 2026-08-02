@@ -12,6 +12,7 @@ mod help;
 mod info;
 mod install;
 mod keys;
+mod llm_review;
 mod news;
 mod order;
 mod pkgbuild;
