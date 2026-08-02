@@ -488,6 +488,8 @@ pub struct Config {
     #[default = "bat"]
     pub bat_bin: String,
     pub fm: Option<String>,
+    pub groq_api_key: Option<String>,
+    pub gemini_api_key: Option<String>,
     pub sudo_loop: Vec<String>,
 
     pub mflags: Vec<String>,
@@ -1025,6 +1027,8 @@ then initialise it with:
             "FileManagerFlags" => self.fm_flags.extend(split),
             "ChrootFlags" => self.chroot_flags.extend(split),
             "PreBuildCommand" => self.pre_build_command = Some(value),
+            "GroqApiKey" => self.groq_api_key = Some(value),
+            "GeminiApiKey" => self.gemini_api_key = Some(value),
             _ => eprintln!(
                 "{}",
                 tr!("error: unknown option '{}' in section [bin]", key)

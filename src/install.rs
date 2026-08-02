@@ -19,6 +19,7 @@ use crate::download::{self, Bases};
 use crate::exec::{command_status, has_command};
 use crate::fmt::{print_indent, print_install, print_install_verbose};
 use crate::keys::check_pgp_keys;
+use crate::llm_review;
 use crate::pkgbuild::PkgbuildRepo;
 use crate::resolver::{flags, resolver};
 use crate::upgrade::{get_upgrades, Upgrades};
@@ -1120,12 +1121,18 @@ impl Installer {
             false
         };
 
+        let use_llm;
         if !config.skip_review && actions.iter_aur_pkgs().next().is_some() {
             if !ask(config, &tr!("Proceed to review?"), true) {
                 return Status::err(1);
             }
-        } else if !ask(config, &tr!("Proceed with installation?"), true) {
-            return Status::err(1);
+            let has_llm = config.groq_api_key.is_some() || config.gemini_api_key.is_some();
+            use_llm = has_llm && ask(config, &tr!("Verify PKGBUILDs with LLM?"), false);
+        } else {
+            use_llm = false;
+            if !ask(config, &tr!("Proceed with installation?"), true) {
+                return Status::err(1);
+            }
         }
 
         if actions.build.is_empty() {
@@ -1167,7 +1174,7 @@ impl Installer {
                     Base::Pkgbuild(_) => None,
                 })
                 .collect::<Vec<_>>();
-            review(config, &config.fetch, &pkgs)?;
+            review(config, &config.fetch, &pkgs, use_llm)?;
         }
 
         let arch = config
@@ -1706,7 +1713,64 @@ fn print_dir(
     Ok(())
 }
 
-pub fn review(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str]) -> Result<()> {
+fn llm_check_pkgs(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str], use_llm: bool) {
+    if !use_llm {
+        return;
+    }
+
+    let c = config.color;
+
+    let pkg_paths: Vec<(&str, PathBuf)> = pkgs
+        .iter()
+        .map(|&pkg| (pkg, fetch.clone_dir.join(pkg).join("PKGBUILD")))
+        .filter(|(_, path)| path.exists())
+        .collect();
+
+    if pkg_paths.is_empty() {
+        return;
+    }
+
+    let pkg_refs: Vec<(&str, &Path)> = pkg_paths
+        .iter()
+        .map(|(name, path)| (*name, path.as_path()))
+        .collect();
+
+    if let Some(ref key) = config.groq_api_key {
+        println!(
+            "\n{} {}",
+            c.action.paint("::"),
+            c.bold.paint("Groq LLM security check:"),
+        );
+        match tokio::task::block_in_place(|| llm_review::check_pkgbuilds_groq(key, &pkg_refs)) {
+            Ok(result) => {
+                for line in result.lines() {
+                    println!("  {}", line);
+                }
+            }
+            Err(e) => eprintln!("  warning: Groq check failed: {}", e),
+        }
+    }
+
+    if let Some(ref key) = config.gemini_api_key {
+        println!(
+            "\n{} {}",
+            c.action.paint("::"),
+            c.bold.paint("Gemini LLM security check:"),
+        );
+        match tokio::task::block_in_place(|| llm_review::check_pkgbuilds_gemini(key, &pkg_refs)) {
+            Ok(result) => {
+                for line in result.lines() {
+                    println!("  {}", line);
+                }
+            }
+            Err(e) => eprintln!("  warning: Gemini check failed: {}", e),
+        }
+    }
+
+    println!();
+}
+
+pub fn review(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str], use_llm: bool) -> Result<()> {
     let c = config.color;
 
     if pkgs.is_empty() {
@@ -1715,6 +1779,8 @@ pub fn review(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str]) -> Resul
     if !config.no_confirm {
         if let Some(ref fm) = config.fm {
             let _view = file_manager(config, fetch, fm, pkgs)?;
+
+            llm_check_pkgs(config, fetch, pkgs, use_llm);
 
             if !ask(config, &tr!("Accept changes?"), true) {
                 return Status::err(1);
@@ -1786,6 +1852,8 @@ pub fn review(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str]) -> Resul
                 drop(stdin);
                 exec::wait(&command, &mut child)?;
                 exec::RAISE_SIGPIPE.store(true, Ordering::Relaxed);
+
+                llm_check_pkgs(config, fetch, pkgs, use_llm);
 
                 if !ask(config, &tr!("Accept changes?"), true) {
                     return Status::err(1);
