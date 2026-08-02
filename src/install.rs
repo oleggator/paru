@@ -1730,10 +1730,12 @@ fn llm_check_pkgs(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str], use_
         return;
     }
 
-    let pkg_refs: Vec<(&str, &Path)> = pkg_paths
+    let commits: Vec<Option<String>> = pkg_paths
         .iter()
-        .map(|(name, path)| (*name, path.as_path()))
+        .map(|(pkg, _)| llm_review::get_commit_hash(&fetch.clone_dir.join(pkg)))
         .collect();
+
+    let mut cache = llm_review::LlmCache::load(&config.cache_dir);
 
     if let Some(ref key) = config.groq_api_key {
         println!(
@@ -1741,14 +1743,10 @@ fn llm_check_pkgs(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str], use_
             c.action.paint("::"),
             c.bold.paint("Groq LLM security check:"),
         );
-        match tokio::task::block_in_place(|| llm_review::check_pkgbuilds_groq(key, &pkg_refs)) {
-            Ok(result) => {
-                for line in result.lines() {
-                    println!("  {}", line);
-                }
-            }
-            Err(e) => eprintln!("  warning: Groq check failed: {}", e),
-        }
+        llm_run_check(
+            "groq", key, &pkg_paths, &commits, &mut cache, c,
+            |k, p| llm_review::check_pkgbuilds_groq(k, p),
+        );
     }
 
     if let Some(ref key) = config.gemini_api_key {
@@ -1757,17 +1755,73 @@ fn llm_check_pkgs(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str], use_
             c.action.paint("::"),
             c.bold.paint("Gemini LLM security check:"),
         );
-        match tokio::task::block_in_place(|| llm_review::check_pkgbuilds_gemini(key, &pkg_refs)) {
-            Ok(result) => {
-                for line in result.lines() {
-                    println!("  {}", line);
+        llm_run_check(
+            "gemini", key, &pkg_paths, &commits, &mut cache, c,
+            |k, p| llm_review::check_pkgbuilds_gemini(k, p),
+        );
+    }
+
+    cache.save();
+    println!();
+}
+
+fn llm_run_check(
+    provider: &str,
+    key: &str,
+    pkg_paths: &[(&str, PathBuf)],
+    commits: &[Option<String>],
+    cache: &mut llm_review::LlmCache,
+    c: crate::config::Colors,
+    call: impl Fn(&str, &[(&str, &Path)]) -> anyhow::Result<String>,
+) {
+    let mut results: HashMap<String, (String, bool)> = HashMap::new();
+    let mut uncached: Vec<(&str, PathBuf)> = Vec::new();
+
+    for ((pkg, path), commit) in pkg_paths.iter().zip(commits) {
+        if let Some(commit) = commit {
+            if let Some(hit) = cache.get(provider, pkg, commit) {
+                results.insert(pkg.to_string(), (hit.to_string(), true));
+                continue;
+            }
+        }
+        uncached.push((pkg, path.clone()));
+    }
+
+    if !uncached.is_empty() {
+        let refs: Vec<(&str, &Path)> = uncached
+            .iter()
+            .map(|(n, p)| (*n, p.as_path()))
+            .collect();
+        match tokio::task::block_in_place(|| call(key, &refs)) {
+            Ok(response) => {
+                let parsed = llm_review::parse_response(&response);
+                for ((pkg, _), commit) in pkg_paths.iter().zip(commits) {
+                    if let Some(result) = parsed.get(*pkg) {
+                        if let Some(commit) = commit {
+                            cache.insert(provider, pkg, commit, result.clone());
+                        }
+                        results.insert(pkg.to_string(), (result.clone(), false));
+                    }
                 }
             }
-            Err(e) => eprintln!("  warning: Gemini check failed: {}", e),
+            Err(e) => eprintln!("  warning: check failed: {}", e),
         }
     }
 
-    println!();
+    for (pkg, _) in pkg_paths {
+        if let Some((result, cached)) = results.get(*pkg) {
+            let suffix = if *cached { " (cached)" } else { "" };
+            println!(
+                "  {} {}{}:",
+                c.action.paint("->"),
+                c.bold.paint(*pkg),
+                suffix,
+            );
+            for line in result.lines() {
+                println!("    {}", line);
+            }
+        }
+    }
 }
 
 pub fn review(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str], use_llm: bool) -> Result<()> {
