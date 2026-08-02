@@ -1713,9 +1713,14 @@ fn print_dir(
     Ok(())
 }
 
-fn llm_check_pkgs(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str], use_llm: bool) {
+fn llm_build_verdict(
+    config: &Config,
+    fetch: &aur_fetch::Fetch,
+    pkgs: &[&str],
+    use_llm: bool,
+) -> Vec<u8> {
     if !use_llm {
-        return;
+        return Vec::new();
     }
 
     let c = config.color;
@@ -1727,7 +1732,7 @@ fn llm_check_pkgs(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str], use_
         .collect();
 
     if pkg_paths.is_empty() {
-        return;
+        return Vec::new();
     }
 
     let commits: Vec<Option<String>> = pkg_paths
@@ -1736,33 +1741,48 @@ fn llm_check_pkgs(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str], use_
         .collect();
 
     let mut cache = llm_review::LlmCache::load(&config.cache_dir);
+    let mut out: Vec<u8> = Vec::new();
 
     if let Some(ref key) = config.groq_api_key {
-        println!(
-            "\n{} {}",
+        let _ = writeln!(
+            out,
+            "{} {}",
             c.action.paint("::"),
-            c.bold.paint("Groq LLM security check:"),
+            c.bold.paint("Groq LLM security check:")
         );
         llm_run_check(
-            "groq", key, &pkg_paths, &commits, &mut cache, c,
+            "groq",
+            key,
+            &pkg_paths,
+            &commits,
+            &mut cache,
+            c,
+            &mut out,
             |k, p| llm_review::check_pkgbuilds_groq(k, p),
         );
     }
 
     if let Some(ref key) = config.gemini_api_key {
-        println!(
-            "\n{} {}",
+        let _ = writeln!(
+            out,
+            "{} {}",
             c.action.paint("::"),
-            c.bold.paint("Gemini LLM security check:"),
+            c.bold.paint("Gemini LLM security check:")
         );
         llm_run_check(
-            "gemini", key, &pkg_paths, &commits, &mut cache, c,
+            "gemini",
+            key,
+            &pkg_paths,
+            &commits,
+            &mut cache,
+            c,
+            &mut out,
             |k, p| llm_review::check_pkgbuilds_gemini(k, p),
         );
     }
 
     cache.save();
-    println!();
+    out
 }
 
 fn llm_run_check(
@@ -1772,6 +1792,7 @@ fn llm_run_check(
     commits: &[Option<String>],
     cache: &mut llm_review::LlmCache,
     c: crate::config::Colors,
+    out: &mut impl Write,
     call: impl Fn(&str, &[(&str, &Path)]) -> anyhow::Result<String>,
 ) {
     let mut results: HashMap<String, (String, bool)> = HashMap::new();
@@ -1788,10 +1809,7 @@ fn llm_run_check(
     }
 
     if !uncached.is_empty() {
-        let refs: Vec<(&str, &Path)> = uncached
-            .iter()
-            .map(|(n, p)| (*n, p.as_path()))
-            .collect();
+        let refs: Vec<(&str, &Path)> = uncached.iter().map(|(n, p)| (*n, p.as_path())).collect();
         match tokio::task::block_in_place(|| call(key, &refs)) {
             Ok(response) => {
                 let parsed = llm_review::parse_response(&response);
@@ -1811,20 +1829,27 @@ fn llm_run_check(
     for (pkg, _) in pkg_paths {
         if let Some((result, cached)) = results.get(*pkg) {
             let suffix = if *cached { " (cached)" } else { "" };
-            println!(
+            let _ = writeln!(
+                out,
                 "  {} {}{}:",
                 c.action.paint("->"),
                 c.bold.paint(*pkg),
-                suffix,
+                suffix
             );
             for line in result.lines() {
-                println!("    {}", line);
+                let _ = writeln!(out, "    {}", line);
             }
         }
     }
+    let _ = writeln!(out);
 }
 
-pub fn review(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str], use_llm: bool) -> Result<()> {
+pub fn review(
+    config: &Config,
+    fetch: &aur_fetch::Fetch,
+    pkgs: &[&str],
+    use_llm: bool,
+) -> Result<()> {
     let c = config.color;
 
     if pkgs.is_empty() {
@@ -1832,9 +1857,12 @@ pub fn review(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str], use_llm:
     }
     if !config.no_confirm {
         if let Some(ref fm) = config.fm {
-            let _view = file_manager(config, fetch, fm, pkgs)?;
+            let verdict = llm_build_verdict(config, fetch, pkgs, use_llm);
+            if !verdict.is_empty() {
+                let _ = std::io::stdout().write_all(&verdict);
+            }
 
-            llm_check_pkgs(config, fetch, pkgs, use_llm);
+            let _view = file_manager(config, fetch, fm, pkgs)?;
 
             if !ask(config, &tr!("Accept changes?"), true) {
                 return Status::err(1);
@@ -1850,6 +1878,8 @@ pub fn review(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str], use_llm:
             let diffs = fetch.diff(&has_diff, config.color.enabled)?;
 
             if printed {
+                let verdict = llm_build_verdict(config, fetch, pkgs, use_llm);
+
                 let pager_unconfigured = var("PARU_PAGER").is_err() && var("PAGER").is_err();
                 let pager = if has_command("less") { "less" } else { "cat" };
 
@@ -1881,6 +1911,10 @@ pub fn review(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str], use_llm:
                     let _ = stdin.write_all(b"\n\n");
                 }
 
+                if !verdict.is_empty() {
+                    let _ = stdin.write_all(&verdict);
+                }
+
                 for (&pkg, diff) in has_diff.iter().zip(diffs) {
                     let _ = write!(
                         stdin,
@@ -1906,8 +1940,6 @@ pub fn review(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str], use_llm:
                 drop(stdin);
                 exec::wait(&command, &mut child)?;
                 exec::RAISE_SIGPIPE.store(true, Ordering::Relaxed);
-
-                llm_check_pkgs(config, fetch, pkgs, use_llm);
 
                 if !ask(config, &tr!("Accept changes?"), true) {
                     return Status::err(1);
