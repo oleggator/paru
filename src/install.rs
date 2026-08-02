@@ -1837,11 +1837,24 @@ fn llm_run_check(
                 suffix
             );
             for line in result.lines() {
-                let _ = writeln!(out, "    {}", line);
+                let _ = writeln!(out, "    {}", colorize_verdict(c, line));
             }
         }
     }
     let _ = writeln!(out);
+}
+
+fn colorize_verdict(c: crate::config::Colors, line: &str) -> String {
+    for (word, style) in &[
+        ("DANGER", c.error),
+        ("CAUTION", c.warning),
+        ("SAFE", c.upgrade),
+    ] {
+        if let Some(rest) = line.strip_prefix(word) {
+            return format!("{}{}", style.paint(*word), rest);
+        }
+    }
+    line.to_string()
 }
 
 pub fn review(
