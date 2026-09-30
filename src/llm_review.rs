@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use anyhow::{Context, Result};
+use reqwest::blocking::{Client, RequestBuilder};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 const SYSTEM_PROMPT: &str = "\
@@ -110,6 +112,27 @@ fn build_prompt(pkgs: &[(&str, &Path)]) -> Result<String> {
     Ok(prompt)
 }
 
+fn post_json<T: DeserializeOwned>(
+    req: RequestBuilder,
+    body: &impl Serialize,
+    api: &str,
+) -> Result<T> {
+    let response = req
+        .json(body)
+        .send()
+        .with_context(|| format!("failed to contact {} API", api))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().unwrap_or_default();
+        anyhow::bail!("{} API error {}: {}", api, status, body);
+    }
+
+    response
+        .json()
+        .with_context(|| format!("failed to parse {} API response", api))
+}
+
 // --- Groq (OpenAI-compatible) ---
 
 const GROQ_API_URL: &str = "https://api.groq.com/openai/v1/chat/completions";
@@ -158,23 +181,8 @@ pub fn check_pkgbuilds_groq(api_key: &str, pkgs: &[(&str, &Path)]) -> Result<Str
         response_format: serde_json::json!({ "type": "json_object" }),
     };
 
-    let client = reqwest::blocking::Client::new();
-    let response = client
-        .post(GROQ_API_URL)
-        .bearer_auth(api_key)
-        .json(&request)
-        .send()
-        .context("failed to contact Groq API")?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().unwrap_or_default();
-        anyhow::bail!("Groq API error {}: {}", status, body);
-    }
-
-    let parsed: ChatResponse = response
-        .json()
-        .context("failed to parse Groq API response")?;
+    let req = Client::new().post(GROQ_API_URL).bearer_auth(api_key);
+    let parsed: ChatResponse = post_json(req, &request, "Groq")?;
 
     parsed
         .choices
@@ -261,23 +269,10 @@ pub fn check_pkgbuilds_gemini(api_key: &str, pkgs: &[(&str, &Path)]) -> Result<S
         },
     };
 
-    let client = reqwest::blocking::Client::new();
-    let response = client
+    let req = Client::new()
         .post(GEMINI_API_URL)
-        .query(&[("key", api_key)])
-        .json(&request)
-        .send()
-        .context("failed to contact Gemini API")?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().unwrap_or_default();
-        anyhow::bail!("Gemini API error {}: {}", status, body);
-    }
-
-    let parsed: GeminiResponse = response
-        .json()
-        .context("failed to parse Gemini API response")?;
+        .query(&[("key", api_key)]);
+    let parsed: GeminiResponse = post_json(req, &request, "Gemini")?;
 
     parsed
         .candidates
