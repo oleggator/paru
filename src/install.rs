@@ -2327,54 +2327,19 @@ mod tests {
     use super::*;
     use crate::config::Colors;
 
-    // colorize_verdict uses strip_prefix so the verdict word must be at the
-    // very start of the line. Colors::default() has no-op styles so the
-    // output text is identical to the input — only the structure is tested.
-
+    // Colors::default() paints nothing, so this only checks no line is mangled.
     #[test]
-    fn colorize_verdict_danger_at_line_start() {
-        let result = colorize_verdict(Colors::default(), "DANGER: downloads curl | bash");
-        assert!(result.starts_with("DANGER"));
-        assert!(result.contains("curl | bash"));
-    }
-
-    #[test]
-    fn colorize_verdict_caution_at_line_start() {
-        let result = colorize_verdict(Colors::default(), "CAUTION: source uses HTTP");
-        assert!(result.starts_with("CAUTION"));
-        assert!(result.contains("HTTP"));
-    }
-
-    #[test]
-    fn colorize_verdict_safe_at_line_start() {
-        let result = colorize_verdict(Colors::default(), "SAFE");
-        assert_eq!(result, "SAFE");
-    }
-
-    // Verdict in the middle of a line must not be matched.
-    #[test]
-    fn colorize_verdict_not_matched_when_not_at_start() {
-        let line = "The verdict is DANGER here";
-        assert_eq!(colorize_verdict(Colors::default(), line), line);
-    }
-
-    // Lowercase must not match — LLM output is expected to be uppercase.
-    #[test]
-    fn colorize_verdict_lowercase_not_matched() {
-        let line = "danger: something bad";
-        assert_eq!(colorize_verdict(Colors::default(), line), line);
-    }
-
-    // Plain finding lines (no verdict word) must pass through unchanged.
-    #[test]
-    fn colorize_verdict_plain_line_unchanged() {
-        let line = "- Uses eval on network response";
-        assert_eq!(colorize_verdict(Colors::default(), line), line);
-    }
-
-    #[test]
-    fn colorize_verdict_empty_line_unchanged() {
-        assert_eq!(colorize_verdict(Colors::default(), ""), "");
+    fn colorize_verdict_keeps_text() {
+        for line in [
+            "DANGER: downloads curl | bash",
+            "CAUTION: source uses HTTP",
+            "SAFE",
+            "The verdict is DANGER here",
+            "danger: something bad",
+            "- Uses eval on network response",
+            "",
+        ] {
+            assert_eq!(colorize_verdict(Colors::default(), line), line);
+        }
     }
 }
-
