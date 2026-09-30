@@ -19,7 +19,7 @@ use crate::download::{self, Bases};
 use crate::exec::{command_status, has_command};
 use crate::fmt::{print_indent, print_install, print_install_verbose};
 use crate::keys::check_pgp_keys;
-use crate::llm_review::{self, check_pkgbuilds_gemini, check_pkgbuilds_groq};
+use crate::llm_review;
 use crate::pkgbuild::PkgbuildRepo;
 use crate::resolver::{flags, resolver};
 use crate::upgrade::{get_upgrades, Upgrades};
@@ -1707,134 +1707,6 @@ fn print_dir(
     Ok(())
 }
 
-fn llm_build_verdict(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str]) -> Vec<u8> {
-    let has_key = config.groq_api_key.is_some() || config.gemini_api_key.is_some();
-    if !has_key || !ask(config, &tr!("Verify PKGBUILDs with LLM?"), false) {
-        return Vec::new();
-    }
-
-    let c = config.color;
-
-    let pkg_paths: Vec<(&str, PathBuf, String)> = pkgs
-        .iter()
-        .filter_map(|&pkg| {
-            let path = fetch.clone_dir.join(pkg).join("PKGBUILD");
-            let hash = llm_review::content_hash(&path)?;
-            Some((pkg, path, hash))
-        })
-        .collect();
-
-    if pkg_paths.is_empty() {
-        return Vec::new();
-    }
-
-    let mut cache = llm_review::LlmCache::load(&config.cache_dir);
-    let mut out: Vec<u8> = Vec::new();
-
-    type Check = fn(&str, &[(&str, &Path)]) -> anyhow::Result<String>;
-    let providers: [(&str, &Option<String>, Check); 2] = [
-        ("Groq", &config.groq_api_key, check_pkgbuilds_groq),
-        ("Gemini", &config.gemini_api_key, check_pkgbuilds_gemini),
-    ];
-    for (label, key, call) in providers {
-        let Some(key) = key else { continue };
-        let _ = writeln!(
-            out,
-            "{} {}",
-            c.action.paint("::"),
-            c.bold.paint(format!("{} LLM security check:", label))
-        );
-        let id = label.to_lowercase();
-        llm_run_check(&id, key, &pkg_paths, &mut cache, c, &mut out, call);
-    }
-
-    cache.save();
-    out
-}
-
-fn llm_run_check(
-    provider: &str,
-    key: &str,
-    pkg_paths: &[(&str, PathBuf, String)],
-    cache: &mut llm_review::LlmCache,
-    c: crate::config::Colors,
-    out: &mut impl Write,
-    call: impl Fn(&str, &[(&str, &Path)]) -> anyhow::Result<String>,
-) {
-    let mut results: HashMap<String, (String, bool)> = HashMap::new();
-    let mut uncached: Vec<(&str, &Path)> = Vec::new();
-
-    for (pkg, path, hash) in pkg_paths {
-        match cache.get(provider, pkg, hash) {
-            Some(hit) => {
-                results.insert(pkg.to_string(), (hit.to_string(), true));
-            }
-            None => uncached.push((pkg, path)),
-        }
-    }
-
-    if !uncached.is_empty() {
-        match tokio::task::block_in_place(|| call(key, &uncached))
-            .and_then(|r| llm_review::parse_response(&r))
-        {
-            Ok(parsed) => {
-                for (pkg, _, hash) in pkg_paths {
-                    if let Some(result) = parsed.get(*pkg) {
-                        cache.insert(provider, pkg, hash, result.clone());
-                        results.insert(pkg.to_string(), (result.clone(), false));
-                    }
-                }
-            }
-            // written into the report: stderr is hidden behind the pager
-            Err(e) => {
-                let _ = writeln!(
-                    out,
-                    "  {} check failed: {:#}",
-                    c.warning.paint("warning:"),
-                    e
-                );
-            }
-        }
-    }
-
-    for (pkg, _, _) in pkg_paths {
-        let Some((result, cached)) = results.get(*pkg) else {
-            let _ = writeln!(
-                out,
-                "  {} {}: no verdict",
-                c.action.paint("->"),
-                c.bold.paint(*pkg)
-            );
-            continue;
-        };
-        let suffix = if *cached { " (cached)" } else { "" };
-        let _ = writeln!(
-            out,
-            "  {} {}{}:",
-            c.action.paint("->"),
-            c.bold.paint(*pkg),
-            suffix
-        );
-        for line in result.lines() {
-            let _ = writeln!(out, "    {}", colorize_verdict(c, line));
-        }
-    }
-    let _ = writeln!(out);
-}
-
-fn colorize_verdict(c: crate::config::Colors, line: &str) -> String {
-    for (word, style) in &[
-        ("DANGER", c.error),
-        ("CAUTION", c.warning),
-        ("SAFE", c.upgrade),
-    ] {
-        if let Some(rest) = line.strip_prefix(word) {
-            return format!("{}{}", style.paint(*word), rest);
-        }
-    }
-    line.to_string()
-}
-
 pub fn review(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str]) -> Result<()> {
     let c = config.color;
 
@@ -1843,7 +1715,7 @@ pub fn review(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str]) -> Resul
     }
     if !config.no_confirm {
         if let Some(ref fm) = config.fm {
-            let verdict = llm_build_verdict(config, fetch, pkgs);
+            let verdict = llm_review::report(config, fetch, pkgs);
             let _ = std::io::stdout().write_all(&verdict);
 
             let _view = file_manager(config, fetch, fm, pkgs)?;
@@ -1862,7 +1734,7 @@ pub fn review(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str]) -> Resul
             let diffs = fetch.diff(&has_diff, config.color.enabled)?;
 
             if printed {
-                let verdict = llm_build_verdict(config, fetch, pkgs);
+                let verdict = llm_review::report(config, fetch, pkgs);
 
                 let pager_unconfigured = var("PARU_PAGER").is_err() && var("PAGER").is_err();
                 let pager = if has_command("less") { "less" } else { "cat" };
@@ -2320,26 +2192,4 @@ fn needs_install(config: &Config, base: &Base, version: &str, pkg: &str) -> bool
 
 fn is_ver_char(c: char) -> bool {
     matches!(c, '<' | '=' | '>')
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::Colors;
-
-    // Colors::default() paints nothing, so this only checks no line is mangled.
-    #[test]
-    fn colorize_verdict_keeps_text() {
-        for line in [
-            "DANGER: downloads curl | bash",
-            "CAUTION: source uses HTTP",
-            "SAFE",
-            "The verdict is DANGER here",
-            "danger: something bad",
-            "- Uses eval on network response",
-            "",
-        ] {
-            assert_eq!(colorize_verdict(Colors::default(), line), line);
-        }
-    }
 }
