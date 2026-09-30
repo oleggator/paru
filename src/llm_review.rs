@@ -1,8 +1,9 @@
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
 
 use anyhow::{Context, Result};
 use reqwest::blocking::{Client, RequestBuilder};
@@ -36,16 +37,16 @@ impl LlmCache {
         Self { path, data }
     }
 
-    pub fn get(&self, provider: &str, pkg: &str, commit: &str) -> Option<&str> {
+    pub fn get(&self, provider: &str, pkg: &str, hash: &str) -> Option<&str> {
         self.data
-            .get(&format!("{}:{}:{}", provider, pkg, commit))
+            .get(&format!("{}:{}:{}", provider, pkg, hash))
             .map(|s| s.as_str())
             .filter(|s| !s.is_empty())
     }
 
-    pub fn insert(&mut self, provider: &str, pkg: &str, commit: &str, result: String) {
+    pub fn insert(&mut self, provider: &str, pkg: &str, hash: &str, result: String) {
         self.data
-            .insert(format!("{}:{}:{}", provider, pkg, commit), result);
+            .insert(format!("{}:{}:{}", provider, pkg, hash), result);
     }
 
     pub fn save(&self) {
@@ -55,18 +56,12 @@ impl LlmCache {
     }
 }
 
-pub fn get_commit_hash(pkg_dir: &Path) -> Option<String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(pkg_dir)
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .ok()?;
-    if output.status.success() {
-        Some(String::from_utf8(output.stdout).ok()?.trim().to_string())
-    } else {
-        None
-    }
+/// Cache key: the PKGBUILD text is exactly what the LLM sees.
+// ponytail: DefaultHasher may change between Rust releases, costing one cache miss
+pub fn content_hash(path: &Path) -> Option<String> {
+    let mut hasher = DefaultHasher::new();
+    fs::read(path).ok()?.hash(&mut hasher);
+    Some(format!("{:016x}", hasher.finish()))
 }
 
 #[derive(Deserialize)]
