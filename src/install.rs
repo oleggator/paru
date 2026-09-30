@@ -1725,20 +1725,18 @@ fn llm_build_verdict(
 
     let c = config.color;
 
-    let pkg_paths: Vec<(&str, PathBuf)> = pkgs
+    let pkg_paths: Vec<(&str, PathBuf, String)> = pkgs
         .iter()
-        .map(|&pkg| (pkg, fetch.clone_dir.join(pkg).join("PKGBUILD")))
-        .filter(|(_, path)| path.exists())
+        .filter_map(|&pkg| {
+            let path = fetch.clone_dir.join(pkg).join("PKGBUILD");
+            let hash = llm_review::content_hash(&path)?;
+            Some((pkg, path, hash))
+        })
         .collect();
 
     if pkg_paths.is_empty() {
         return Vec::new();
     }
-
-    let commits: Vec<Option<String>> = pkg_paths
-        .iter()
-        .map(|(pkg, _)| llm_review::get_commit_hash(&fetch.clone_dir.join(pkg)))
-        .collect();
 
     let mut cache = llm_review::LlmCache::load(&config.cache_dir);
     let mut out: Vec<u8> = Vec::new();
@@ -1750,16 +1748,9 @@ fn llm_build_verdict(
             c.action.paint("::"),
             c.bold.paint("Groq LLM security check:")
         );
-        llm_run_check(
-            "groq",
-            key,
-            &pkg_paths,
-            &commits,
-            &mut cache,
-            c,
-            &mut out,
-            |k, p| llm_review::check_pkgbuilds_groq(k, p),
-        );
+        llm_run_check("groq", key, &pkg_paths, &mut cache, c, &mut out, |k, p| {
+            llm_review::check_pkgbuilds_groq(k, p)
+        });
     }
 
     if let Some(ref key) = config.gemini_api_key {
@@ -1773,7 +1764,6 @@ fn llm_build_verdict(
             "gemini",
             key,
             &pkg_paths,
-            &commits,
             &mut cache,
             c,
             &mut out,
@@ -1788,37 +1778,32 @@ fn llm_build_verdict(
 fn llm_run_check(
     provider: &str,
     key: &str,
-    pkg_paths: &[(&str, PathBuf)],
-    commits: &[Option<String>],
+    pkg_paths: &[(&str, PathBuf, String)],
     cache: &mut llm_review::LlmCache,
     c: crate::config::Colors,
     out: &mut impl Write,
     call: impl Fn(&str, &[(&str, &Path)]) -> anyhow::Result<String>,
 ) {
     let mut results: HashMap<String, (String, bool)> = HashMap::new();
-    let mut uncached: Vec<(&str, PathBuf)> = Vec::new();
+    let mut uncached: Vec<(&str, &Path)> = Vec::new();
 
-    for ((pkg, path), commit) in pkg_paths.iter().zip(commits) {
-        if let Some(commit) = commit {
-            if let Some(hit) = cache.get(provider, pkg, commit) {
+    for (pkg, path, hash) in pkg_paths {
+        match cache.get(provider, pkg, hash) {
+            Some(hit) => {
                 results.insert(pkg.to_string(), (hit.to_string(), true));
-                continue;
             }
+            None => uncached.push((pkg, path)),
         }
-        uncached.push((pkg, path.clone()));
     }
 
     if !uncached.is_empty() {
-        let refs: Vec<(&str, &Path)> = uncached.iter().map(|(n, p)| (*n, p.as_path())).collect();
-        match tokio::task::block_in_place(|| call(key, &refs))
+        match tokio::task::block_in_place(|| call(key, &uncached))
             .and_then(|r| llm_review::parse_response(&r))
         {
             Ok(parsed) => {
-                for ((pkg, _), commit) in pkg_paths.iter().zip(commits) {
+                for (pkg, _, hash) in pkg_paths {
                     if let Some(result) = parsed.get(*pkg) {
-                        if let Some(commit) = commit {
-                            cache.insert(provider, pkg, commit, result.clone());
-                        }
+                        cache.insert(provider, pkg, hash, result.clone());
                         results.insert(pkg.to_string(), (result.clone(), false));
                     }
                 }
@@ -1835,7 +1820,7 @@ fn llm_run_check(
         }
     }
 
-    for (pkg, _) in pkg_paths {
+    for (pkg, _, _) in pkg_paths {
         let Some((result, cached)) = results.get(*pkg) else {
             let _ = writeln!(
                 out,
