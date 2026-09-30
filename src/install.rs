@@ -1121,18 +1121,12 @@ impl Installer {
             false
         };
 
-        let use_llm;
         if !config.skip_review && actions.iter_aur_pkgs().next().is_some() {
             if !ask(config, &tr!("Proceed to review?"), true) {
                 return Status::err(1);
             }
-            let has_llm = config.groq_api_key.is_some() || config.gemini_api_key.is_some();
-            use_llm = has_llm && ask(config, &tr!("Verify PKGBUILDs with LLM?"), false);
-        } else {
-            use_llm = false;
-            if !ask(config, &tr!("Proceed with installation?"), true) {
-                return Status::err(1);
-            }
+        } else if !ask(config, &tr!("Proceed with installation?"), true) {
+            return Status::err(1);
         }
 
         if actions.build.is_empty() {
@@ -1174,7 +1168,7 @@ impl Installer {
                     Base::Pkgbuild(_) => None,
                 })
                 .collect::<Vec<_>>();
-            review(config, &config.fetch, &pkgs, use_llm)?;
+            review(config, &config.fetch, &pkgs)?;
         }
 
         let arch = config
@@ -1713,13 +1707,9 @@ fn print_dir(
     Ok(())
 }
 
-fn llm_build_verdict(
-    config: &Config,
-    fetch: &aur_fetch::Fetch,
-    pkgs: &[&str],
-    use_llm: bool,
-) -> Vec<u8> {
-    if !use_llm {
+fn llm_build_verdict(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str]) -> Vec<u8> {
+    let has_key = config.groq_api_key.is_some() || config.gemini_api_key.is_some();
+    if !has_key || !ask(config, &tr!("Verify PKGBUILDs with LLM?"), false) {
         return Vec::new();
     }
 
@@ -1845,12 +1835,7 @@ fn colorize_verdict(c: crate::config::Colors, line: &str) -> String {
     line.to_string()
 }
 
-pub fn review(
-    config: &Config,
-    fetch: &aur_fetch::Fetch,
-    pkgs: &[&str],
-    use_llm: bool,
-) -> Result<()> {
+pub fn review(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str]) -> Result<()> {
     let c = config.color;
 
     if pkgs.is_empty() {
@@ -1858,7 +1843,7 @@ pub fn review(
     }
     if !config.no_confirm {
         if let Some(ref fm) = config.fm {
-            let verdict = llm_build_verdict(config, fetch, pkgs, use_llm);
+            let verdict = llm_build_verdict(config, fetch, pkgs);
             if !verdict.is_empty() {
                 let _ = std::io::stdout().write_all(&verdict);
             }
@@ -1879,7 +1864,7 @@ pub fn review(
             let diffs = fetch.diff(&has_diff, config.color.enabled)?;
 
             if printed {
-                let verdict = llm_build_verdict(config, fetch, pkgs, use_llm);
+                let verdict = llm_build_verdict(config, fetch, pkgs);
 
                 let pager_unconfigured = var("PARU_PAGER").is_err() && var("PAGER").is_err();
                 let pager = if has_command("less") { "less" } else { "cat" };

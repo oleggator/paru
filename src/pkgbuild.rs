@@ -7,7 +7,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::{download::print_download, exec, install::review, util::ask};
+use crate::{download::print_download, exec, install::review};
 use alpm_utils::Targ;
 use anyhow::{anyhow, bail, Context, Result};
 use aur_fetch::Fetch;
@@ -405,9 +405,7 @@ impl PkgbuildRepos {
             })
             .map(|r| r.name.as_str())
             .collect::<Vec<_>>();
-        let has_llm = config.groq_api_key.is_some() || config.gemini_api_key.is_some();
-        let use_llm = has_llm && ask(config, &tr!("Verify PKGBUILDs with LLM?"), false);
-        review(config, &self.fetch, &review_repos, use_llm)?;
+        review(config, &self.fetch, &review_repos)?;
 
         let all_repos = repos.iter().map(|r| r.name.as_str()).collect::<Vec<_>>();
         self.fetch.merge(&all_repos)?;
