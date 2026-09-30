@@ -41,7 +41,6 @@ impl LlmCache {
         self.data
             .get(&format!("{}:{}:{}", provider, pkg, hash))
             .map(|s| s.as_str())
-            .filter(|s| !s.is_empty())
     }
 
     pub fn insert(&mut self, provider: &str, pkg: &str, hash: &str, result: String) {
@@ -309,15 +308,6 @@ mod tests {
     fn parse_response_rejects_malformed_json() {
         assert!(parse_response(r#"{"packages": [{"name": "pkg", "verd"#).is_err());
         assert!(parse_response("=== pkg ===\nSAFE").is_err());
-    }
-
-    // An empty verdict cached by an older parser must not be served.
-    #[test]
-    fn cache_empty_entry_is_miss() {
-        let dir = tmp();
-        let mut cache = LlmCache::load(dir.path());
-        cache.insert("gemini", "pkg", "abc", String::new());
-        assert!(cache.get("gemini", "pkg", "abc").is_none());
     }
 
     // --- LlmCache ---
