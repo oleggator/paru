@@ -1844,9 +1844,7 @@ pub fn review(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str]) -> Resul
     if !config.no_confirm {
         if let Some(ref fm) = config.fm {
             let verdict = llm_build_verdict(config, fetch, pkgs);
-            if !verdict.is_empty() {
-                let _ = std::io::stdout().write_all(&verdict);
-            }
+            let _ = std::io::stdout().write_all(&verdict);
 
             let _view = file_manager(config, fetch, fm, pkgs)?;
 
@@ -1897,9 +1895,7 @@ pub fn review(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str]) -> Resul
                     let _ = stdin.write_all(b"\n\n");
                 }
 
-                if !verdict.is_empty() {
-                    let _ = stdin.write_all(&verdict);
-                }
+                let _ = stdin.write_all(&verdict);
 
                 for (&pkg, diff) in has_diff.iter().zip(diffs) {
                     let _ = write!(
