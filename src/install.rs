@@ -19,7 +19,7 @@ use crate::download::{self, Bases};
 use crate::exec::{command_status, has_command};
 use crate::fmt::{print_indent, print_install, print_install_verbose};
 use crate::keys::check_pgp_keys;
-use crate::llm_review;
+use crate::llm_review::{self, check_pkgbuilds_gemini, check_pkgbuilds_groq};
 use crate::pkgbuild::PkgbuildRepo;
 use crate::resolver::{flags, resolver};
 use crate::upgrade::{get_upgrades, Upgrades};
@@ -1741,34 +1741,21 @@ fn llm_build_verdict(
     let mut cache = llm_review::LlmCache::load(&config.cache_dir);
     let mut out: Vec<u8> = Vec::new();
 
-    if let Some(ref key) = config.groq_api_key {
+    type Check = fn(&str, &[(&str, &Path)]) -> anyhow::Result<String>;
+    let providers: [(&str, &Option<String>, Check); 2] = [
+        ("Groq", &config.groq_api_key, check_pkgbuilds_groq),
+        ("Gemini", &config.gemini_api_key, check_pkgbuilds_gemini),
+    ];
+    for (label, key, call) in providers {
+        let Some(key) = key else { continue };
         let _ = writeln!(
             out,
             "{} {}",
             c.action.paint("::"),
-            c.bold.paint("Groq LLM security check:")
+            c.bold.paint(format!("{} LLM security check:", label))
         );
-        llm_run_check("groq", key, &pkg_paths, &mut cache, c, &mut out, |k, p| {
-            llm_review::check_pkgbuilds_groq(k, p)
-        });
-    }
-
-    if let Some(ref key) = config.gemini_api_key {
-        let _ = writeln!(
-            out,
-            "{} {}",
-            c.action.paint("::"),
-            c.bold.paint("Gemini LLM security check:")
-        );
-        llm_run_check(
-            "gemini",
-            key,
-            &pkg_paths,
-            &mut cache,
-            c,
-            &mut out,
-            |k, p| llm_review::check_pkgbuilds_gemini(k, p),
-        );
+        let id = label.to_lowercase();
+        llm_run_check(&id, key, &pkg_paths, &mut cache, c, &mut out, call);
     }
 
     cache.save();
