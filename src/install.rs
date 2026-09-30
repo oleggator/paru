@@ -1810,9 +1810,10 @@ fn llm_run_check(
 
     if !uncached.is_empty() {
         let refs: Vec<(&str, &Path)> = uncached.iter().map(|(n, p)| (*n, p.as_path())).collect();
-        match tokio::task::block_in_place(|| call(key, &refs)) {
-            Ok(response) => {
-                let parsed = llm_review::parse_response(&response);
+        match tokio::task::block_in_place(|| call(key, &refs))
+            .and_then(|r| llm_review::parse_response(&r))
+        {
+            Ok(parsed) => {
                 for ((pkg, _), commit) in pkg_paths.iter().zip(commits) {
                     if let Some(result) = parsed.get(*pkg) {
                         if let Some(commit) = commit {
@@ -1822,23 +1823,38 @@ fn llm_run_check(
                     }
                 }
             }
-            Err(e) => eprintln!("  warning: check failed: {}", e),
+            // written into the report: stderr is hidden behind the pager
+            Err(e) => {
+                let _ = writeln!(
+                    out,
+                    "  {} check failed: {:#}",
+                    c.warning.paint("warning:"),
+                    e
+                );
+            }
         }
     }
 
     for (pkg, _) in pkg_paths {
-        if let Some((result, cached)) = results.get(*pkg) {
-            let suffix = if *cached { " (cached)" } else { "" };
+        let Some((result, cached)) = results.get(*pkg) else {
             let _ = writeln!(
                 out,
-                "  {} {}{}:",
+                "  {} {}: no verdict",
                 c.action.paint("->"),
-                c.bold.paint(*pkg),
-                suffix
+                c.bold.paint(*pkg)
             );
-            for line in result.lines() {
-                let _ = writeln!(out, "    {}", colorize_verdict(c, line));
-            }
+            continue;
+        };
+        let suffix = if *cached { " (cached)" } else { "" };
+        let _ = writeln!(
+            out,
+            "  {} {}{}:",
+            c.action.paint("->"),
+            c.bold.paint(*pkg),
+            suffix
+        );
+        for line in result.lines() {
+            let _ = writeln!(out, "    {}", colorize_verdict(c, line));
         }
     }
     let _ = writeln!(out);
@@ -2352,3 +2368,60 @@ fn needs_install(config: &Config, base: &Base, version: &str, pkg: &str) -> bool
 fn is_ver_char(c: char) -> bool {
     matches!(c, '<' | '=' | '>')
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Colors;
+
+    // colorize_verdict uses strip_prefix so the verdict word must be at the
+    // very start of the line. Colors::default() has no-op styles so the
+    // output text is identical to the input — only the structure is tested.
+
+    #[test]
+    fn colorize_verdict_danger_at_line_start() {
+        let result = colorize_verdict(Colors::default(), "DANGER: downloads curl | bash");
+        assert!(result.starts_with("DANGER"));
+        assert!(result.contains("curl | bash"));
+    }
+
+    #[test]
+    fn colorize_verdict_caution_at_line_start() {
+        let result = colorize_verdict(Colors::default(), "CAUTION: source uses HTTP");
+        assert!(result.starts_with("CAUTION"));
+        assert!(result.contains("HTTP"));
+    }
+
+    #[test]
+    fn colorize_verdict_safe_at_line_start() {
+        let result = colorize_verdict(Colors::default(), "SAFE");
+        assert_eq!(result, "SAFE");
+    }
+
+    // Verdict in the middle of a line must not be matched.
+    #[test]
+    fn colorize_verdict_not_matched_when_not_at_start() {
+        let line = "The verdict is DANGER here";
+        assert_eq!(colorize_verdict(Colors::default(), line), line);
+    }
+
+    // Lowercase must not match — LLM output is expected to be uppercase.
+    #[test]
+    fn colorize_verdict_lowercase_not_matched() {
+        let line = "danger: something bad";
+        assert_eq!(colorize_verdict(Colors::default(), line), line);
+    }
+
+    // Plain finding lines (no verdict word) must pass through unchanged.
+    #[test]
+    fn colorize_verdict_plain_line_unchanged() {
+        let line = "- Uses eval on network response";
+        assert_eq!(colorize_verdict(Colors::default(), line), line);
+    }
+
+    #[test]
+    fn colorize_verdict_empty_line_unchanged() {
+        assert_eq!(colorize_verdict(Colors::default(), ""), "");
+    }
+}
+
