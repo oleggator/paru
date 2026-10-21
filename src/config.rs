@@ -380,6 +380,15 @@ impl ConfigEnum for YesNoAllTree {
     ];
 }
 
+/// A string that `--debug` logs as `<redacted>`.
+pub struct Secret(pub String);
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
 #[derive(SmartDefault, Debug)]
 pub struct Config {
     section: Option<String>,
@@ -490,7 +499,7 @@ pub struct Config {
     pub fm: Option<String>,
     #[default = "https://api.openai.com/v1"]
     pub llm_api_url: String,
-    pub llm_api_key: Option<String>,
+    pub llm_api_key: Option<Secret>,
     pub llm_model: Option<String>,
     pub sudo_loop: Vec<String>,
 
@@ -1030,7 +1039,7 @@ then initialise it with:
             "ChrootFlags" => self.chroot_flags.extend(split),
             "PreBuildCommand" => self.pre_build_command = Some(value),
             "LlmApiUrl" => self.llm_api_url = value,
-            "LlmApiKey" => self.llm_api_key = Some(value),
+            "LlmApiKey" => self.llm_api_key = Some(Secret(value)),
             "LlmModel" => self.llm_model = Some(value),
             _ => eprintln!(
                 "{}",
