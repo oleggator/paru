@@ -1,8 +1,6 @@
 use std::collections::HashMap;
-use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -106,36 +104,51 @@ fn parse_response(response: &str) -> Result<HashMap<String, String>> {
 
 // --- Shared ---
 
-/// Every file git tracks for the package, not just the PKGBUILD:
-/// `.install` scripts run as root and patches change the built code.
+/// Every file git tracks upstream, not just the PKGBUILD: `.install` scripts
+/// run as root and patches change the built code. Read from `HEAD@{u}`, the
+/// ref the review diff shows: PKGBUILD repos are reviewed before they are
+/// merged, so their working tree is still the old version.
 fn read_pkg(fetch: &aur_fetch::Fetch, pkg: &str) -> Result<String> {
     let dir = fetch.clone_dir.join(pkg);
-    let mut cmd = Command::new(&fetch.git);
-    cmd.args(&fetch.git_flags)
-        .current_dir(&dir)
-        .args(["ls-files", "-z"]);
-    let files = exec::command_output(&mut cmd)?.stdout;
+    let git = |args: &[&str]| -> Result<Vec<u8>> {
+        let mut cmd = Command::new(&fetch.git);
+        cmd.args(&fetch.git_flags).current_dir(&dir).args(args);
+        Ok(exec::command_output(&mut cmd)?.stdout)
+    };
 
     let mut content = String::new();
-    for file in files.split(|&b| b == 0).filter(|f| !f.is_empty()) {
-        let file = Path::new(OsStr::from_bytes(file));
+    let tree = git(&["ls-tree", "-r", "-z", "HEAD@{u}"])?;
+    for entry in tree.split(|&b| b == 0).filter(|e| !e.is_empty()) {
+        // "<mode> <type> <object>\t<path>"
+        let entry = String::from_utf8_lossy(entry);
+        let Some((meta, file)) = entry.split_once('\t') else {
+            continue;
+        };
+        let meta: Vec<&str> = meta.split(' ').collect();
+        let [mode, _, object] = meta[..] else {
+            continue;
+        };
         // generated from the PKGBUILD and never run
-        if file == Path::new(".SRCINFO") {
+        if file == ".SRCINFO" {
             continue;
         }
-        let path = dir.join(file);
-        // never follow: a tracked link to ~/.ssh/id_rsa would send the key to the API
-        let text = if path.symlink_metadata()?.is_symlink() {
-            format!("<symlink to {}>", fs::read_link(&path)?.display())
-        } else {
-            let bytes = fs::read(&path)?;
-            if bytes.contains(&0) {
-                format!("<binary file, {} bytes>", bytes.len())
-            } else {
-                String::from_utf8_lossy(&bytes).into_owned()
+        let text = match mode {
+            "160000" => format!("<submodule at {}>", object),
+            // a link's blob is its target: nothing outside the repo is read
+            "120000" => format!(
+                "<symlink to {}>",
+                String::from_utf8_lossy(&git(&["cat-file", "blob", object])?)
+            ),
+            _ => {
+                let bytes = git(&["cat-file", "blob", object])?;
+                if bytes.contains(&0) {
+                    format!("<binary file, {} bytes>", bytes.len())
+                } else {
+                    String::from_utf8_lossy(&bytes).into_owned()
+                }
             }
         };
-        content.push_str(&format!("--- {} ---\n```\n{}\n```\n", file.display(), text));
+        content.push_str(&format!("--- {} ---\n```\n{}\n```\n", file, text));
     }
     Ok(content)
 }
@@ -430,36 +443,47 @@ mod tests {
 
     // needs git on PATH, like the rest of paru
     #[test]
-    fn read_pkg_includes_tracked_files_only() {
+    fn read_pkg_reads_upstream_tracked_files() {
         let dir = tmp();
-        let pkg = dir.path().join("pkg");
-        fs::create_dir(&pkg).unwrap();
-        fs::write(pkg.join("PKGBUILD"), "pkgname=pkg").unwrap();
-        fs::write(pkg.join("pkg.install"), "post_install() { :; }").unwrap();
-        fs::write(pkg.join(".SRCINFO"), "pkgbase = pkg").unwrap();
-        fs::write(pkg.join("icon.png"), b"\x89PNG\0\0").unwrap();
-        fs::write(pkg.join("untracked"), "x").unwrap();
-        std::os::unix::fs::symlink("/etc/passwd", pkg.join("link")).unwrap();
-        let git = |args: &[&str]| {
-            assert!(Command::new("git")
-                .current_dir(&pkg)
+        let git = |cwd: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .current_dir(cwd)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
                 .args(args)
                 .output()
-                .unwrap()
-                .status
-                .success())
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
         };
-        git(&["init", "-q"]);
-        git(&[
-            "add",
-            "PKGBUILD",
-            "pkg.install",
-            ".SRCINFO",
-            "icon.png",
-            "link",
-        ]);
+        let up = dir.path().join("upstream");
+        fs::create_dir(&up).unwrap();
+        fs::write(up.join("PKGBUILD"), "pkgname=pkg").unwrap();
+        fs::write(up.join("pkg.install"), "post_install() { :; }").unwrap();
+        fs::write(up.join(".SRCINFO"), "pkgbase = pkg").unwrap();
+        fs::write(up.join("icon.png"), b"\x89PNG\0\0").unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", up.join("link")).unwrap();
+        git(&up, &["init", "-q"]);
+        git(&up, &["add", "."]);
+        git(&up, &["commit", "-qm", "init"]);
 
-        let fetch = aur_fetch::Fetch::with_combined_cache_dir(dir.path());
+        let clone = dir.path().join("clone");
+        fs::create_dir(&clone).unwrap();
+        git(&clone, &["clone", "-q", up.to_str().unwrap(), "pkg"]);
+        // the working tree is not what gets reviewed
+        fs::write(clone.join("pkg/PKGBUILD"), "local edit").unwrap();
+        fs::write(clone.join("pkg/untracked"), "x").unwrap();
+
+        let fetch = aur_fetch::Fetch::with_combined_cache_dir(&clone);
         assert_eq!(
             read_pkg(&fetch, "pkg").unwrap(),
             "--- PKGBUILD ---\n```\npkgname=pkg\n```\n\
