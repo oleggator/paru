@@ -1,7 +1,10 @@
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::fs;
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{Context, Result};
 use reqwest::blocking::Client;
@@ -9,11 +12,14 @@ use serde::{Deserialize, Serialize};
 use tr::tr;
 
 use crate::config::{Colors, Config};
+use crate::exec;
 use crate::util::ask;
 
 const SYSTEM_PROMPT: &str = "\
-You are a security auditor reviewing Arch Linux PKGBUILD files. \
-Analyze each PKGBUILD for security issues such as: \
+You are a security auditor reviewing Arch Linux AUR packages. \
+Each package lists every file in its git repository: the PKGBUILD, \
+install scripts (run as root), patches and other local sources. \
+Analyze each package for security issues such as: \
 arbitrary command execution risks, suspicious source URLs or checksums, \
 use of eval or dynamic code execution, download of unverified binaries, \
 overly broad permissions, and any other red flags. \
@@ -93,10 +99,44 @@ fn parse_response(response: &str) -> Result<HashMap<String, String>> {
 
 // --- Shared ---
 
+/// Every file git tracks for the package, not just the PKGBUILD:
+/// `.install` scripts run as root and patches change the built code.
+fn read_pkg(fetch: &aur_fetch::Fetch, pkg: &str) -> Result<String> {
+    let dir = fetch.clone_dir.join(pkg);
+    let mut cmd = Command::new(&fetch.git);
+    cmd.args(&fetch.git_flags)
+        .current_dir(&dir)
+        .args(["ls-files", "-z"]);
+    let files = exec::command_output(&mut cmd)?.stdout;
+
+    let mut content = String::new();
+    for file in files.split(|&b| b == 0).filter(|f| !f.is_empty()) {
+        let file = Path::new(OsStr::from_bytes(file));
+        // generated from the PKGBUILD and never run
+        if file == Path::new(".SRCINFO") {
+            continue;
+        }
+        let path = dir.join(file);
+        // never follow: a tracked link to ~/.ssh/id_rsa would send the key to the API
+        let text = if path.symlink_metadata()?.is_symlink() {
+            format!("<symlink to {}>", fs::read_link(&path)?.display())
+        } else {
+            let bytes = fs::read(&path)?;
+            if bytes.contains(&0) {
+                format!("<binary file, {} bytes>", bytes.len())
+            } else {
+                String::from_utf8_lossy(&bytes).into_owned()
+            }
+        };
+        content.push_str(&format!("--- {} ---\n```\n{}\n```\n", file.display(), text));
+    }
+    Ok(content)
+}
+
 fn build_prompt(pkgs: &[(&str, &str)]) -> String {
     let mut prompt = String::new();
     for &(name, content) in pkgs {
-        prompt.push_str(&format!("=== {} ===\n```\n{}\n```\n\n", name, content));
+        prompt.push_str(&format!("=== {} ===\n{}\n", name, content));
     }
     prompt
 }
@@ -184,10 +224,7 @@ pub fn report(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str]) -> Vec<u
     // read once: what is cached is exactly what the LLM sees
     let pkg_contents: Vec<(&str, String)> = pkgs
         .iter()
-        .filter_map(|&pkg| {
-            let bytes = fs::read(fetch.clone_dir.join(pkg).join("PKGBUILD")).ok()?;
-            Some((pkg, String::from_utf8_lossy(&bytes).into_owned()))
-        })
+        .filter_map(|&pkg| Some((pkg, read_pkg(fetch, pkg).ok()?)))
         .collect();
 
     if pkg_contents.is_empty() {
@@ -355,12 +392,51 @@ mod tests {
     }
 
     #[test]
-    fn build_prompt_wraps_each_pkgbuild_in_order() {
-        let prompt = build_prompt(&[("alpha", "pkgname=alpha"), ("beta", "pkgname=beta")]);
+    fn build_prompt_wraps_each_package_in_order() {
+        let prompt = build_prompt(&[("alpha", "a"), ("beta", "b")]);
+        assert_eq!(prompt, "=== alpha ===\na\n=== beta ===\nb\n");
+    }
+
+    // needs git on PATH, like the rest of paru
+    #[test]
+    fn read_pkg_includes_tracked_files_only() {
+        let dir = tmp();
+        let pkg = dir.path().join("pkg");
+        fs::create_dir(&pkg).unwrap();
+        fs::write(pkg.join("PKGBUILD"), "pkgname=pkg").unwrap();
+        fs::write(pkg.join("pkg.install"), "post_install() { :; }").unwrap();
+        fs::write(pkg.join(".SRCINFO"), "pkgbase = pkg").unwrap();
+        fs::write(pkg.join("icon.png"), b"\x89PNG\0\0").unwrap();
+        fs::write(pkg.join("untracked"), "x").unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", pkg.join("link")).unwrap();
+        let git = |args: &[&str]| {
+            assert!(Command::new("git")
+                .current_dir(&pkg)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success())
+        };
+        git(&["init", "-q"]);
+        git(&[
+            "add",
+            "PKGBUILD",
+            "pkg.install",
+            ".SRCINFO",
+            "icon.png",
+            "link",
+        ]);
+
+        let fetch = aur_fetch::Fetch::with_combined_cache_dir(dir.path());
         assert_eq!(
-            prompt,
-            "=== alpha ===\n```\npkgname=alpha\n```\n\n=== beta ===\n```\npkgname=beta\n```\n\n"
+            read_pkg(&fetch, "pkg").unwrap(),
+            "--- PKGBUILD ---\n```\npkgname=pkg\n```\n\
+             --- icon.png ---\n```\n<binary file, 6 bytes>\n```\n\
+             --- link ---\n```\n<symlink to /etc/passwd>\n```\n\
+             --- pkg.install ---\n```\npost_install() { :; }\n```\n"
         );
+        assert!(read_pkg(&fetch, "ghost").is_err());
     }
 
     // Colors::default() paints nothing, so this only checks no line is mangled.
