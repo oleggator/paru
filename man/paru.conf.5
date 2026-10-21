@@ -390,6 +390,32 @@ that package.
 
 The variables PKGBASE and VERSION will be set for the command to use.
 
+.TP
+.B LlmModel = Model
+Enables LLM security review. During PKGBUILD review paru asks whether to send
+each package's files (the PKGBUILD, install scripts, patches and other files
+tracked in its git repository) to an LLM, and shows its SAFE, CAUTION or DANGER
+verdict next to the diff. Verdicts are cached per package until its files
+change. The verdict is advice only: a PKGBUILD can try to mislead the model, so
+still read the diff.
+
+.TP
+.B LlmApiUrl = URL
+Base URL of an OpenAI-compatible chat completions API; paru posts to
+\fBURL/chat/completions\fR. Package files are sent to this server.
+
+Defaults to "https://api.openai.com/v1".
+
+.TP
+.B LlmApiKey = Key
+API key sent as a bearer token. Can be left unset for local servers.
+
+.TP
+.B LlmTemperature = N
+Sampling temperature sent with each request. Unset by default, as some models
+reject anything but the default. Set it to 0 for steadier verdicts on models
+that accept it.
+
 .SH ENV
 Set environment variables.
 

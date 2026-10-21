@@ -119,7 +119,7 @@ struct PkgReport {
 /// Returns "VERDICT\n- finding\n- finding" per package name.
 fn parse_response(response: &str) -> Result<HashMap<String, String>> {
     let report: Report =
-        serde_json::from_str(response.trim()).context("LLM returned malformed JSON")?;
+        serde_json::from_str(response.trim()).context(tr!("LLM returned malformed JSON"))?;
     report
         .packages
         .into_iter()
@@ -127,9 +127,11 @@ fn parse_response(response: &str) -> Result<HashMap<String, String>> {
             // servers that ignore the schema can return anything
             anyhow::ensure!(
                 matches!(p.verdict.as_str(), "SAFE" | "CAUTION" | "DANGER"),
-                "LLM returned unknown verdict {:?} for {}",
-                p.verdict,
-                p.name
+                tr!(
+                    "LLM returned unknown verdict {verdict} for {pkg}",
+                    verdict = format!("{:?}", p.verdict),
+                    pkg = p.name
+                )
             );
             let mut text = p.verdict;
             for f in p.findings {
@@ -276,23 +278,27 @@ fn check_pkgbuilds(config: &Config, model: &str, pkgs: &[(&str, &str)]) -> Resul
     if let Some(key) = &config.llm_api_key {
         req = req.bearer_auth(&key.0);
     }
-    let response = req.send().context("failed to contact LLM API")?;
+    let response = req.send().context(tr!("failed to contact LLM API"))?;
 
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().unwrap_or_default();
-        anyhow::bail!("LLM API error {}: {}", status, body);
+        anyhow::bail!(tr!(
+            "LLM API error {status}: {body}",
+            status = status,
+            body = body
+        ));
     }
 
     let parsed: ChatResponse = response
         .json()
-        .context("failed to parse LLM API response")?;
+        .context(tr!("failed to parse LLM API response"))?;
     parsed
         .choices
         .into_iter()
         .next()
         .map(|c| c.message.content)
-        .context("empty response from LLM API")
+        .context(tr!("empty response from LLM API"))
 }
 
 pub fn report(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str]) -> Vec<u8> {
@@ -310,7 +316,8 @@ pub fn report(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str]) -> Vec<u
         out,
         "{} {}",
         c.action.paint("::"),
-        c.bold.paint(format!("LLM security check ({}):", model))
+        c.bold
+            .paint(tr!("LLM security check ({model}):", model = model))
     );
 
     // read once: what is cached is exactly what the LLM sees
@@ -321,10 +328,13 @@ pub fn report(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str]) -> Vec<u
             Err(e) => {
                 let _ = writeln!(
                     out,
-                    "  {} {}: not checked: {}",
-                    c.warning.paint("warning:"),
-                    pkg,
-                    printable(&format!("{:#}", e))
+                    "  {} {}",
+                    c.warning.paint(tr!("warning:")),
+                    tr!(
+                        "{pkg}: not checked: {err}",
+                        pkg = pkg,
+                        err = printable(&format!("{:#}", e))
+                    )
                 );
             }
         }
@@ -379,9 +389,9 @@ fn llm_run_check(
             Err(e) => {
                 let _ = writeln!(
                     out,
-                    "  {} check failed: {}",
-                    c.warning.paint("warning:"),
-                    printable(&format!("{:#}", e))
+                    "  {} {}",
+                    c.warning.paint(tr!("warning:")),
+                    tr!("check failed: {err}", err = printable(&format!("{:#}", e)))
                 );
             }
         }
@@ -391,13 +401,18 @@ fn llm_run_check(
         let Some((result, cached)) = results.get(*pkg) else {
             let _ = writeln!(
                 out,
-                "  {} {}: no verdict",
+                "  {} {}: {}",
                 c.action.paint("->"),
-                c.bold.paint(*pkg)
+                c.bold.paint(*pkg),
+                tr!("no verdict")
             );
             continue;
         };
-        let suffix = if *cached { " (cached)" } else { "" };
+        let suffix = if *cached {
+            format!(" {}", tr!("(cached)"))
+        } else {
+            String::new()
+        };
         let _ = writeln!(
             out,
             "  {} {}{}:",
