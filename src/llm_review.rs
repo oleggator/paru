@@ -261,18 +261,6 @@ pub fn report(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str]) -> Vec<u
     }
 
     let c = config.color;
-
-    // read once: what is cached is exactly what the LLM sees
-    let pkg_contents: Vec<(&str, String)> = pkgs
-        .iter()
-        .filter_map(|&pkg| Some((pkg, read_pkg(fetch, pkg).ok()?)))
-        .collect();
-
-    if pkg_contents.is_empty() {
-        return Vec::new();
-    }
-
-    let mut cache = LlmCache::load(&config.cache_dir);
     let mut out: Vec<u8> = Vec::new();
 
     let _ = writeln!(
@@ -281,6 +269,25 @@ pub fn report(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str]) -> Vec<u
         c.action.paint("::"),
         c.bold.paint(format!("LLM security check ({}):", model))
     );
+
+    // read once: what is cached is exactly what the LLM sees
+    let mut pkg_contents: Vec<(&str, String)> = Vec::new();
+    for &pkg in pkgs {
+        match read_pkg(fetch, pkg) {
+            Ok(content) => pkg_contents.push((pkg, content)),
+            Err(e) => {
+                let _ = writeln!(
+                    out,
+                    "  {} {}: not checked: {:#}",
+                    c.warning.paint("warning:"),
+                    pkg,
+                    e
+                );
+            }
+        }
+    }
+
+    let mut cache = LlmCache::load(&config.cache_dir);
     llm_run_check(config, model, &pkg_contents, &mut cache, c, &mut out);
 
     cache.save();
