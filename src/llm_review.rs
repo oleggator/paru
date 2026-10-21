@@ -27,12 +27,21 @@ Use an empty findings list if nothing is suspicious.";
 
 // --- Cache ---
 
-/// "model:pkg" -> (content sent to the LLM, verdict). Comparing the full
-/// content instead of a hash means a crafted PKGBUILD can't collide with a
-/// cached SAFE one, and only the latest version of each package is kept.
+/// Verdicts from an older SYSTEM_PROMPT are stale, so the file is dropped
+/// when it changes.
+#[derive(Serialize, Deserialize)]
+struct CacheFile {
+    prompt: String,
+    /// "provider:pkg" -> (content sent to the LLM, verdict). Comparing the
+    /// full content instead of a hash means a crafted PKGBUILD can't collide
+    /// with a cached SAFE one, and only the latest version of each package is
+    /// kept.
+    entries: HashMap<String, (String, String)>,
+}
+
 struct LlmCache {
     path: PathBuf,
-    data: HashMap<String, (String, String)>,
+    data: CacheFile,
 }
 
 impl LlmCache {
@@ -40,21 +49,28 @@ impl LlmCache {
         let path = cache_dir.join("llm-review.json");
         let data = fs::read_to_string(&path)
             .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+            .and_then(|s| serde_json::from_str::<CacheFile>(&s).ok())
+            .filter(|d| d.prompt == SYSTEM_PROMPT)
+            .unwrap_or_else(|| CacheFile {
+                prompt: SYSTEM_PROMPT.to_string(),
+                entries: HashMap::new(),
+            });
         Self { path, data }
     }
 
-    fn get(&self, model: &str, pkg: &str, content: &str) -> Option<&str> {
+    fn get(&self, provider: &str, pkg: &str, content: &str) -> Option<&str> {
         self.data
-            .get(&format!("{}:{}", model, pkg))
+            .entries
+            .get(&format!("{}:{}", provider, pkg))
             .filter(|(cached, _)| cached == content)
             .map(|(_, verdict)| verdict.as_str())
     }
 
-    fn insert(&mut self, model: &str, pkg: &str, content: &str, verdict: String) {
-        self.data
-            .insert(format!("{}:{}", model, pkg), (content.to_string(), verdict));
+    fn insert(&mut self, provider: &str, pkg: &str, content: &str, verdict: String) {
+        self.data.entries.insert(
+            format!("{}:{}", provider, pkg),
+            (content.to_string(), verdict),
+        );
     }
 
     fn save(&self) {
@@ -294,7 +310,7 @@ pub fn report(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str]) -> Vec<u
     out
 }
 
-/// Verdicts are cached per model, so switching models re-reviews.
+/// Verdicts are cached per API URL and model, so switching either re-reviews.
 fn llm_run_check(
     config: &Config,
     model: &str,
@@ -303,11 +319,12 @@ fn llm_run_check(
     c: Colors,
     out: &mut impl Write,
 ) {
+    let provider = format!("{} {}", config.llm_api_url, model);
     let mut results: HashMap<String, (String, bool)> = HashMap::new();
     let mut uncached: Vec<(&str, &str)> = Vec::new();
 
     for (pkg, content) in pkg_contents {
-        match cache.get(model, pkg, content) {
+        match cache.get(&provider, pkg, content) {
             Some(hit) => {
                 results.insert(pkg.to_string(), (hit.to_string(), true));
             }
@@ -326,7 +343,7 @@ fn llm_run_check(
                         continue;
                     }
                     if let Some(result) = parsed.get(*pkg) {
-                        cache.insert(model, pkg, content, result.clone());
+                        cache.insert(&provider, pkg, content, result.clone());
                         results.insert(pkg.to_string(), (result.clone(), false));
                     }
                 }
@@ -443,8 +460,16 @@ mod tests {
         assert!(cache.get("model-a", "pkg", "v1").is_none());
         assert!(cache.get("model-b", "pkg", "v2").is_none());
 
+        // verdicts from another prompt are dropped
+        let file = dir.path().join("llm-review.json");
+        let old = fs::read_to_string(&file).unwrap();
+        fs::write(&file, old.replace("security auditor", "auditor")).unwrap();
+        assert!(LlmCache::load(dir.path())
+            .get("model-a", "pkg", "v2")
+            .is_none());
+
         // a corrupt file falls back to an empty cache
-        fs::write(dir.path().join("llm-review.json"), "not json").unwrap();
+        fs::write(&file, "not json").unwrap();
         assert!(LlmCache::load(dir.path())
             .get("model-a", "pkg", "v2")
             .is_none());
