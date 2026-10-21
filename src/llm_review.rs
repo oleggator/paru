@@ -42,20 +42,29 @@ struct CacheFile {
 struct LlmCache {
     path: PathBuf,
     data: CacheFile,
+    /// entries added this run, merged into the file on save
+    added: HashMap<String, (String, String)>,
 }
 
 impl LlmCache {
-    fn load(cache_dir: &Path) -> Self {
-        let path = cache_dir.join("llm-review.json");
-        let data = fs::read_to_string(&path)
+    fn read(path: &Path) -> CacheFile {
+        fs::read_to_string(path)
             .ok()
             .and_then(|s| serde_json::from_str::<CacheFile>(&s).ok())
             .filter(|d| d.prompt == SYSTEM_PROMPT)
             .unwrap_or_else(|| CacheFile {
                 prompt: SYSTEM_PROMPT.to_string(),
                 entries: HashMap::new(),
-            });
-        Self { path, data }
+            })
+    }
+
+    fn load(cache_dir: &Path) -> Self {
+        let path = cache_dir.join("llm-review.json");
+        Self {
+            data: Self::read(&path),
+            path,
+            added: HashMap::new(),
+        }
     }
 
     fn get(&self, provider: &str, pkg: &str, content: &str) -> Option<&str> {
@@ -67,15 +76,29 @@ impl LlmCache {
     }
 
     fn insert(&mut self, provider: &str, pkg: &str, content: &str, verdict: String) {
-        self.data.entries.insert(
-            format!("{}:{}", provider, pkg),
-            (content.to_string(), verdict),
-        );
+        let key = format!("{}:{}", provider, pkg);
+        let entry = (content.to_string(), verdict);
+        self.data.entries.insert(key.clone(), entry.clone());
+        self.added.insert(key, entry);
     }
 
-    fn save(&self) {
-        if let Ok(json) = serde_json::to_string(&self.data) {
-            let _ = fs::write(&self.path, json);
+    /// Merges into what is on disk now, since another paru may have saved
+    /// since load, then renames a temp file over it so it is never torn.
+    // ponytail: no lock, two saves inside the read-rename window can still drop entries
+    fn save(self) {
+        if self.added.is_empty() {
+            return;
+        }
+        let mut data = Self::read(&self.path);
+        data.entries.extend(self.added);
+        let Ok(json) = serde_json::to_string(&data) else {
+            return;
+        };
+        let tmp = self
+            .path
+            .with_extension(format!("json.{}", std::process::id()));
+        if fs::write(&tmp, json).is_err() || fs::rename(&tmp, &self.path).is_err() {
+            let _ = fs::remove_file(&tmp);
         }
     }
 }
@@ -477,6 +500,25 @@ mod tests {
         assert!(LlmCache::load(dir.path())
             .get("model-a", "pkg", "v2")
             .is_none());
+    }
+
+    #[test]
+    fn cache_save_merges_concurrent_runs() {
+        let dir = tmp();
+        // nothing added: no file written
+        LlmCache::load(dir.path()).save();
+        assert!(!dir.path().join("llm-review.json").exists());
+
+        let mut a = LlmCache::load(dir.path());
+        let mut b = LlmCache::load(dir.path());
+        a.insert("m", "pkg-a", "a", "SAFE".to_string());
+        b.insert("m", "pkg-b", "b", "DANGER".to_string());
+        a.save();
+        b.save();
+
+        let cache = LlmCache::load(dir.path());
+        assert_eq!(cache.get("m", "pkg-a", "a"), Some("SAFE"));
+        assert_eq!(cache.get("m", "pkg-b", "b"), Some("DANGER"));
     }
 
     #[test]
