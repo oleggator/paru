@@ -41,6 +41,32 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md).
 
 - **Tracking -git packages**: Paru tracks -git package by monitoring the upstream repository. Paru can only do this for packages that paru itself installed. `paru --gendb` will make paru aware of packages it did not install.
 
+- **LLM PKGBUILD review**: Set `LlmModel` in the `[bin]` section of `paru.conf` to have an LLM check PKGBUILDs for security issues during review. Any OpenAI-compatible API works. `LlmApiUrl` defaults to OpenAI, and `LlmApiKey` is optional for local servers.
+
+  ```ini
+  # OpenAI
+  [bin]
+  LlmApiKey = sk-...
+  LlmModel = gpt-5-mini
+
+  # Google Gemini
+  [bin]
+  LlmApiUrl = https://generativelanguage.googleapis.com/v1beta/openai
+  LlmApiKey = ...
+  LlmModel = gemini-3.5-flash-lite
+
+  # Groq
+  [bin]
+  LlmApiUrl = https://api.groq.com/openai/v1
+  LlmApiKey = gsk_...
+  LlmModel = llama-3.3-70b-versatile
+
+  # Ollama (local, no key)
+  [bin]
+  LlmApiUrl = http://localhost:11434/v1
+  LlmModel = llama3.1
+  ```
+
 ## Examples
 
 `paru <target>` -- Interactively search and install `<target>`.
