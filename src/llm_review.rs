@@ -183,6 +183,9 @@ fn build_prompt(pkgs: &[(&str, &str)]) -> String {
 struct ChatRequest {
     model: String,
     messages: Vec<ChatMessage>,
+    // unset by default: OpenAI reasoning models reject anything but 1
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
     response_format: serde_json::Value,
 }
 
@@ -215,6 +218,7 @@ fn check_pkgbuilds(config: &Config, model: &str, pkgs: &[(&str, &str)]) -> Resul
                 content: build_prompt(pkgs),
             },
         ],
+        temperature: config.llm_temperature,
         response_format: serde_json::json!({
             "type": "json_schema",
             "json_schema": {
