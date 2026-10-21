@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{Context, Result};
-use reqwest::blocking::Client;
+use futures::stream::{self, StreamExt};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tr::tr;
 
@@ -17,15 +18,15 @@ use crate::exec;
 use crate::util::ask;
 
 const SYSTEM_PROMPT: &str = "\
-You are a security auditor reviewing Arch Linux AUR packages. \
-Each package lists every file in its git repository: the PKGBUILD, \
+You are a security auditor reviewing an Arch Linux AUR package. \
+You get every file in its git repository: the PKGBUILD, \
 install scripts (run as root), patches and other local sources. \
-Analyze each package for security issues such as: \
+Analyze it for security issues such as: \
 arbitrary command execution risks, suspicious source URLs or checksums, \
 use of eval or dynamic code execution, download of unverified binaries, \
 overly broad permissions, and any other red flags. \
-Respond with JSON: {\"packages\": [{\"name\": \"<name from the === name === header>\", \
-\"verdict\": \"SAFE\" | \"CAUTION\" | \"DANGER\", \"findings\": [\"<short finding>\"]}]}. \
+Respond with JSON: {\"verdict\": \"SAFE\" | \"CAUTION\" | \"DANGER\", \
+\"findings\": [\"<short finding>\"]}. \
 Use an empty findings list if nothing is suspicious.";
 
 // --- Cache ---
@@ -133,45 +134,21 @@ impl Level {
     }
 }
 
+/// Also the LLM's response, so an unknown verdict fails to parse: servers
+/// that ignore the schema can return anything.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 struct Verdict {
+    #[serde(alias = "verdict")]
     level: Level,
+    #[serde(default)]
     findings: Vec<String>,
     /// set on cache hits, never stored
     #[serde(skip)]
     cached: bool,
 }
 
-#[derive(Deserialize)]
-struct Report {
-    packages: Vec<PkgReport>,
-}
-
-/// An unknown verdict fails to parse: servers that ignore the schema can
-/// return anything.
-#[derive(Deserialize)]
-struct PkgReport {
-    name: String,
-    verdict: Level,
-    #[serde(default)]
-    findings: Vec<String>,
-}
-
-fn parse_response(response: &str) -> Result<HashMap<String, Verdict>> {
-    let report: Report =
-        serde_json::from_str(response.trim()).context(tr!("LLM returned malformed JSON"))?;
-    Ok(report
-        .packages
-        .into_iter()
-        .map(|p| {
-            let verdict = Verdict {
-                level: p.verdict,
-                findings: p.findings,
-                cached: false,
-            };
-            (p.name, verdict)
-        })
-        .collect())
+fn parse_response(response: &str) -> Result<Verdict> {
+    serde_json::from_str(response.trim()).context(tr!("LLM returned malformed JSON"))
 }
 
 // --- Shared ---
@@ -225,14 +202,6 @@ fn read_pkg(fetch: &aur_fetch::Fetch, pkg: &str) -> Result<String> {
     Ok(content)
 }
 
-fn build_prompt(pkgs: &[(&str, &str)]) -> String {
-    let mut prompt = String::new();
-    for &(name, content) in pkgs {
-        prompt.push_str(&format!("=== {} ===\n{}\n", name, content));
-    }
-    prompt
-}
-
 // --- OpenAI-compatible chat completions ---
 
 #[derive(Serialize)]
@@ -261,7 +230,15 @@ struct ChatChoice {
     message: ChatMessage,
 }
 
-fn check_pkgbuilds(config: &Config, model: &str, pkgs: &[(&str, &str)]) -> Result<String> {
+/// One request per package: a PKGBUILD can't steer another package's verdict,
+/// one failure loses one verdict, and large updates stay within context.
+async fn check_pkg(
+    config: &Config,
+    client: &Client,
+    model: &str,
+    pkg: &str,
+    content: &str,
+) -> Result<Verdict> {
     let request = ChatRequest {
         model: model.to_string(),
         messages: vec![
@@ -271,7 +248,7 @@ fn check_pkgbuilds(config: &Config, model: &str, pkgs: &[(&str, &str)]) -> Resul
             },
             ChatMessage {
                 role: "user".to_string(),
-                content: build_prompt(pkgs),
+                content: format!("Package {}:\n{}", pkg, content),
             },
         ],
         temperature: config.llm_temperature,
@@ -282,17 +259,11 @@ fn check_pkgbuilds(config: &Config, model: &str, pkgs: &[(&str, &str)]) -> Resul
                 "strict": true,
                 "schema": {
                     "type": "object",
-                    "properties": { "packages": { "type": "array", "items": {
-                        "type": "object",
-                        "properties": {
-                            "name": { "type": "string" },
-                            "verdict": { "type": "string", "enum": ["SAFE", "CAUTION", "DANGER"] },
-                            "findings": { "type": "array", "items": { "type": "string" } },
-                        },
-                        "required": ["name", "verdict", "findings"],
-                        "additionalProperties": false,
-                    }}},
-                    "required": ["packages"],
+                    "properties": {
+                        "verdict": { "type": "string", "enum": ["SAFE", "CAUTION", "DANGER"] },
+                        "findings": { "type": "array", "items": { "type": "string" } },
+                    },
+                    "required": ["verdict", "findings"],
                     "additionalProperties": false,
                 },
             },
@@ -303,17 +274,15 @@ fn check_pkgbuilds(config: &Config, model: &str, pkgs: &[(&str, &str)]) -> Resul
         "{}/chat/completions",
         config.llm_api_url.trim_end_matches('/')
     );
-    // the blocking default of 30s is too short for reasoning or local models
-    let client = Client::builder().timeout(None).build()?;
     let mut req = client.post(url).json(&request);
     if let Some(key) = &config.llm_api_key {
         req = req.bearer_auth(&key.0);
     }
-    let response = req.send().context(tr!("failed to contact LLM API"))?;
+    let response = req.send().await.context(tr!("failed to contact LLM API"))?;
 
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().unwrap_or_default();
+        let body = response.text().await.unwrap_or_default();
         anyhow::bail!(tr!(
             "LLM API error {status}: {body}",
             status = status,
@@ -323,13 +292,15 @@ fn check_pkgbuilds(config: &Config, model: &str, pkgs: &[(&str, &str)]) -> Resul
 
     let parsed: ChatResponse = response
         .json()
+        .await
         .context(tr!("failed to parse LLM API response"))?;
-    parsed
+    let answer = parsed
         .choices
         .into_iter()
         .next()
         .map(|c| c.message.content)
-        .context(tr!("empty response from LLM API"))
+        .context(tr!("empty response from LLM API"))?;
+    parse_response(&answer)
 }
 
 /// Verdicts for one review: a summary goes at the top of the review and a
@@ -362,6 +333,31 @@ fn api_error_message(body: &str) -> String {
             .take(300)
             .collect(),
     }
+}
+
+/// One warning per distinct error, so an outage isn't repeated per package.
+fn failure_warnings(failures: Vec<(&str, String)>, total: usize) -> Vec<String> {
+    let mut groups: Vec<(String, Vec<&str>)> = Vec::new();
+    for (pkg, err) in failures {
+        match groups.iter_mut().find(|(e, _)| *e == err) {
+            Some((_, pkgs)) => pkgs.push(pkg),
+            None => groups.push((err, vec![pkg])),
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(err, pkgs)| {
+            if pkgs.len() == total {
+                tr!("check failed: {err}", err = err)
+            } else {
+                tr!(
+                    "{pkgs}: check failed: {err}",
+                    pkgs = pkgs.join(", "),
+                    err = err
+                )
+            }
+        })
+        .collect()
 }
 
 pub fn check(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str]) -> Option<LlmReport> {
@@ -407,23 +403,42 @@ pub fn check(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str]) -> Option
     }
 
     if !uncached.is_empty() {
-        match tokio::task::block_in_place(|| check_pkgbuilds(config, model, &uncached))
-            .and_then(|r| parse_response(&r))
-        {
-            // only packages in the prompt: a PKGBUILD could inject verdicts for others
-            Ok(parsed) => {
-                for (pkg, content) in uncached {
-                    if let Some(verdict) = parsed.get(pkg) {
-                        cache.insert(&provider, pkg, content, verdict.clone());
-                        report.verdicts.insert(pkg.to_string(), verdict.clone());
-                    }
+        let c = config.color;
+        let n = uncached.len();
+        println!(
+            "{} {}",
+            c.action.paint("::"),
+            c.bold.paint(tr!(
+                "Checking {n} package with {model}..."
+                    | "Checking {n} packages with {model}..." % n,
+                model = model
+            ))
+        );
+
+        // paru's shared async client: no total timeout, which slow models need
+        let client = config.raur.client().clone();
+        // ponytail: 4 at a time eases rate limits but can't promise to stay under a
+        // per-minute cap, and a 429 is not retried; add backoff if that bites
+        let results: Vec<Result<Verdict>> = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(
+                stream::iter(&uncached)
+                    .map(|&(pkg, content)| check_pkg(config, &client, model, pkg, content))
+                    .buffered(4)
+                    .collect(),
+            )
+        });
+
+        let mut failures = Vec::new();
+        for (&(pkg, content), result) in uncached.iter().zip(results) {
+            match result {
+                Ok(verdict) => {
+                    cache.insert(&provider, pkg, content, verdict.clone());
+                    report.verdicts.insert(pkg.to_string(), verdict);
                 }
+                Err(e) => failures.push((pkg, printable(&format!("{:#}", e)))),
             }
-            Err(e) => report.warnings.push(tr!(
-                "check failed: {err}",
-                err = printable(&format!("{:#}", e))
-            )),
         }
+        report.warnings.extend(failure_warnings(failures, n));
     }
 
     cache.save();
@@ -529,26 +544,39 @@ mod tests {
     // --- parse_response ---
 
     #[test]
-    fn parse_response_reads_verdicts() {
-        let input = r#"{"packages": [
-            {"name": "clean-pkg", "verdict": "SAFE", "findings": []},
-            {"name": "bad-pkg", "verdict": "DANGER", "findings": ["Runs curl | bash", "Uses eval"]}
-        ]}"#;
-        let result = parse_response(input).unwrap();
-        assert_eq!(result["clean-pkg"], verdict(Level::Safe, &[]));
+    fn parse_response_reads_verdict() {
         assert_eq!(
-            result["bad-pkg"],
-            verdict(Level::Danger, &["Runs curl | bash", "Uses eval"])
+            parse_response(r#"{"verdict": "SAFE", "findings": []}"#).unwrap(),
+            verdict(Level::Safe, &[])
+        );
+        assert_eq!(
+            parse_response(r#" {"verdict": "DANGER", "findings": ["curl | sh", "eval"]} "#)
+                .unwrap(),
+            verdict(Level::Danger, &["curl | sh", "eval"])
         );
     }
 
-    // Truncated or non-JSON output must be an error, not an empty report.
+    // Truncated, non-JSON or off-schema output must be an error, not a verdict.
     #[test]
     fn parse_response_rejects_malformed_json() {
-        assert!(parse_response(r#"{"packages": [{"name": "pkg", "verd"#).is_err());
-        assert!(parse_response("=== pkg ===\nSAFE").is_err());
-        assert!(
-            parse_response(r#"{"packages": [{"name": "pkg", "verdict": "Low risk"}]}"#).is_err()
+        assert!(parse_response(r#"{"verdict": "SA"#).is_err());
+        assert!(parse_response("SAFE").is_err());
+        assert!(parse_response(r#"{"verdict": "Low risk"}"#).is_err());
+    }
+
+    #[test]
+    fn failure_warnings_group_identical_errors() {
+        let outage = vec![("a", "503".to_string()), ("b", "503".to_string())];
+        assert_eq!(failure_warnings(outage, 2), ["check failed: 503"]);
+
+        let mixed = vec![
+            ("a", "503".to_string()),
+            ("b", "400".to_string()),
+            ("c", "503".to_string()),
+        ];
+        assert_eq!(
+            failure_warnings(mixed, 4),
+            ["a, c: check failed: 503", "b: check failed: 400"]
         );
     }
 
@@ -600,12 +628,6 @@ mod tests {
         let cache = LlmCache::load(dir.path());
         assert_eq!(cache.get("m", "pkg-a", "a").unwrap().level, Level::Safe);
         assert_eq!(cache.get("m", "pkg-b", "b").unwrap().level, Level::Danger);
-    }
-
-    #[test]
-    fn build_prompt_wraps_each_package_in_order() {
-        let prompt = build_prompt(&[("alpha", "a"), ("beta", "b")]);
-        assert_eq!(prompt, "=== alpha ===\na\n=== beta ===\nb\n");
     }
 
     // needs git on PATH, like the rest of paru
@@ -738,5 +760,67 @@ mod tests {
             "<html> <b>502</b> </html>"
         );
         assert_eq!(api_error_message(&"x".repeat(1000)).len(), 300);
+    }
+
+    // A canned reply on a local port: the request goes out as the API expects
+    // and the reply comes back as a verdict, without a real server.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn check_pkg_round_trip() {
+        use std::io::{BufRead, BufReader, Read};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let (mut head, mut len) = (String::new(), 0);
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" {
+                    break;
+                }
+                if let Some(v) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                    len = v.trim().parse().unwrap();
+                }
+                head.push_str(&line);
+            }
+            let mut body = vec![0; len];
+            reader.read_exact(&mut body).unwrap();
+
+            let content = r#"{\"verdict\": \"CAUTION\", \"findings\": [\"http source\"]}"#;
+            let answer = format!(
+                r#"{{"choices": [{{"message": {{"role": "assistant", "content": "{}"}}}}]}}"#,
+                content
+            );
+            write!(
+                &stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                answer.len(),
+                answer
+            )
+            .unwrap();
+            (head, body)
+        });
+
+        let mut config = Config::default();
+        config.llm_api_url = format!("http://{}/v1/", addr);
+        config.llm_api_key = Some(crate::config::Secret("k".to_string()));
+        // the sandbox or user may have a proxy set
+        let client = Client::builder().no_proxy().build().unwrap();
+        let got = check_pkg(&config, &client, "m", "pkg", "files")
+            .await
+            .unwrap();
+        assert_eq!(got, verdict(Level::Caution, &["http source"]));
+
+        let (head, body) = server.join().unwrap();
+        assert!(head.starts_with("POST /v1/chat/completions "), "{}", head);
+        assert!(head
+            .to_ascii_lowercase()
+            .contains("authorization: bearer k"));
+        let req: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(req["model"], "m");
+        assert_eq!(req["messages"][1]["content"], "Package pkg:\nfiles");
+        assert!(req.get("temperature").is_none());
     }
 }
