@@ -9,6 +9,8 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use tr::tr;
 
+use ansiterm::Style;
+
 use crate::config::{Colors, Config};
 use crate::exec;
 use crate::util::ask;
@@ -36,14 +38,14 @@ struct CacheFile {
     /// full content instead of a hash means a crafted PKGBUILD can't collide
     /// with a cached SAFE one, and only the latest version of each package is
     /// kept.
-    entries: HashMap<String, (String, String)>,
+    entries: HashMap<String, (String, Verdict)>,
 }
 
 struct LlmCache {
     path: PathBuf,
     data: CacheFile,
     /// entries added this run, merged into the file on save
-    added: HashMap<String, (String, String)>,
+    added: HashMap<String, (String, Verdict)>,
 }
 
 impl LlmCache {
@@ -67,15 +69,15 @@ impl LlmCache {
         }
     }
 
-    fn get(&self, provider: &str, pkg: &str, content: &str) -> Option<&str> {
+    fn get(&self, provider: &str, pkg: &str, content: &str) -> Option<&Verdict> {
         self.data
             .entries
             .get(&format!("{}:{}", provider, pkg))
             .filter(|(cached, _)| cached == content)
-            .map(|(_, verdict)| verdict.as_str())
+            .map(|(_, verdict)| verdict)
     }
 
-    fn insert(&mut self, provider: &str, pkg: &str, content: &str, verdict: String) {
+    fn insert(&mut self, provider: &str, pkg: &str, content: &str, verdict: Verdict) {
         let key = format!("{}:{}", provider, pkg);
         let entry = (content.to_string(), verdict);
         self.data.entries.insert(key.clone(), entry.clone());
@@ -103,44 +105,72 @@ impl LlmCache {
     }
 }
 
+/// Ordered by severity.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "UPPERCASE")]
+enum Level {
+    Safe,
+    Caution,
+    Danger,
+}
+
+impl Level {
+    fn word(self) -> &'static str {
+        match self {
+            Level::Safe => "SAFE",
+            Level::Caution => "CAUTION",
+            Level::Danger => "DANGER",
+        }
+    }
+
+    fn style(self, c: Colors) -> Style {
+        match self {
+            Level::Safe => c.upgrade,
+            Level::Caution => c.warning,
+            Level::Danger => c.error,
+        }
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+struct Verdict {
+    level: Level,
+    findings: Vec<String>,
+    /// set on cache hits, never stored
+    #[serde(skip)]
+    cached: bool,
+}
+
 #[derive(Deserialize)]
 struct Report {
     packages: Vec<PkgReport>,
 }
 
+/// An unknown verdict fails to parse: servers that ignore the schema can
+/// return anything.
 #[derive(Deserialize)]
 struct PkgReport {
     name: String,
-    verdict: String,
+    verdict: Level,
     #[serde(default)]
     findings: Vec<String>,
 }
 
-/// Returns "VERDICT\n- finding\n- finding" per package name.
-fn parse_response(response: &str) -> Result<HashMap<String, String>> {
+fn parse_response(response: &str) -> Result<HashMap<String, Verdict>> {
     let report: Report =
         serde_json::from_str(response.trim()).context(tr!("LLM returned malformed JSON"))?;
-    report
+    Ok(report
         .packages
         .into_iter()
         .map(|p| {
-            // servers that ignore the schema can return anything
-            anyhow::ensure!(
-                matches!(p.verdict.as_str(), "SAFE" | "CAUTION" | "DANGER"),
-                tr!(
-                    "LLM returned unknown verdict {verdict} for {pkg}",
-                    verdict = format!("{:?}", p.verdict),
-                    pkg = p.name
-                )
-            );
-            let mut text = p.verdict;
-            for f in p.findings {
-                text.push_str("\n- ");
-                text.push_str(&f);
-            }
-            Ok((p.name, text))
+            let verdict = Verdict {
+                level: p.verdict,
+                findings: p.findings,
+                cached: false,
+            };
+            (p.name, verdict)
         })
-        .collect()
+        .collect())
 }
 
 // --- Shared ---
@@ -357,13 +387,17 @@ fn llm_run_check(
     out: &mut impl Write,
 ) {
     let provider = format!("{} {}", config.llm_api_url, model);
-    let mut results: HashMap<String, (String, bool)> = HashMap::new();
+    let mut results: HashMap<String, Verdict> = HashMap::new();
     let mut uncached: Vec<(&str, &str)> = Vec::new();
 
     for (pkg, content) in pkg_contents {
         match cache.get(&provider, pkg, content) {
             Some(hit) => {
-                results.insert(pkg.to_string(), (hit.to_string(), true));
+                let hit = Verdict {
+                    cached: true,
+                    ..hit.clone()
+                };
+                results.insert(pkg.to_string(), hit);
             }
             None => uncached.push((pkg, content)),
         }
@@ -381,7 +415,7 @@ fn llm_run_check(
                     }
                     if let Some(result) = parsed.get(*pkg) {
                         cache.insert(&provider, pkg, content, result.clone());
-                        results.insert(pkg.to_string(), (result.clone(), false));
+                        results.insert(pkg.to_string(), result.clone());
                     }
                 }
             }
@@ -398,7 +432,7 @@ fn llm_run_check(
     }
 
     for (pkg, _) in pkg_contents {
-        let Some((result, cached)) = results.get(*pkg) else {
+        let Some(verdict) = results.get(*pkg) else {
             let _ = writeln!(
                 out,
                 "  {} {}: {}",
@@ -408,7 +442,7 @@ fn llm_run_check(
             );
             continue;
         };
-        let suffix = if *cached {
+        let suffix = if verdict.cached {
             format!(" {}", tr!("(cached)"))
         } else {
             String::new()
@@ -420,8 +454,10 @@ fn llm_run_check(
             c.bold.paint(*pkg),
             suffix
         );
-        for line in result.lines() {
-            let _ = writeln!(out, "    {}", colorize_verdict(c, &printable(line)));
+        let level = verdict.level;
+        let _ = writeln!(out, "    {}", level.style(c).paint(level.word()));
+        for finding in &verdict.findings {
+            let _ = writeln!(out, "    - {}", printable(finding));
         }
     }
     let _ = writeln!(out);
@@ -435,19 +471,6 @@ fn printable(s: &str) -> String {
         .collect()
 }
 
-fn colorize_verdict(c: Colors, line: &str) -> String {
-    for (word, style) in &[
-        ("DANGER", c.error),
-        ("CAUTION", c.warning),
-        ("SAFE", c.upgrade),
-    ] {
-        if let Some(rest) = line.strip_prefix(word) {
-            return format!("{}{}", style.paint(*word), rest);
-        }
-    }
-    line.to_string()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -458,19 +481,27 @@ mod tests {
         tempfile::tempdir().expect("failed to create tempdir")
     }
 
+    fn verdict(level: Level, findings: &[&str]) -> Verdict {
+        Verdict {
+            level,
+            findings: findings.iter().map(|f| f.to_string()).collect(),
+            cached: false,
+        }
+    }
+
     // --- parse_response ---
 
     #[test]
-    fn parse_response_formats_verdict_then_findings() {
+    fn parse_response_reads_verdicts() {
         let input = r#"{"packages": [
             {"name": "clean-pkg", "verdict": "SAFE", "findings": []},
             {"name": "bad-pkg", "verdict": "DANGER", "findings": ["Runs curl | bash", "Uses eval"]}
         ]}"#;
         let result = parse_response(input).unwrap();
-        assert_eq!(result.get("clean-pkg").unwrap(), "SAFE");
+        assert_eq!(result["clean-pkg"], verdict(Level::Safe, &[]));
         assert_eq!(
-            result.get("bad-pkg").unwrap(),
-            "DANGER\n- Runs curl | bash\n- Uses eval"
+            result["bad-pkg"],
+            verdict(Level::Danger, &["Runs curl | bash", "Uses eval"])
         );
     }
 
@@ -489,15 +520,13 @@ mod tests {
         let dir = tmp();
         let mut cache = LlmCache::load(dir.path());
         assert!(cache.get("model-a", "pkg", "v1").is_none());
-        cache.insert("model-a", "pkg", "v1", "SAFE".to_string());
-        cache.insert("model-a", "pkg", "v2", "DANGER\n- curl | bash".to_string());
+        cache.insert("model-a", "pkg", "v1", verdict(Level::Safe, &[]));
+        let danger = verdict(Level::Danger, &["curl | bash"]);
+        cache.insert("model-a", "pkg", "v2", danger.clone());
         cache.save();
 
         let cache = LlmCache::load(dir.path());
-        assert_eq!(
-            cache.get("model-a", "pkg", "v2"),
-            Some("DANGER\n- curl | bash")
-        );
+        assert_eq!(cache.get("model-a", "pkg", "v2"), Some(&danger));
         // a changed PKGBUILD or another model must not reuse the verdict
         assert!(cache.get("model-a", "pkg", "v1").is_none());
         assert!(cache.get("model-b", "pkg", "v2").is_none());
@@ -526,14 +555,14 @@ mod tests {
 
         let mut a = LlmCache::load(dir.path());
         let mut b = LlmCache::load(dir.path());
-        a.insert("m", "pkg-a", "a", "SAFE".to_string());
-        b.insert("m", "pkg-b", "b", "DANGER".to_string());
+        a.insert("m", "pkg-a", "a", verdict(Level::Safe, &[]));
+        b.insert("m", "pkg-b", "b", verdict(Level::Danger, &[]));
         a.save();
         b.save();
 
         let cache = LlmCache::load(dir.path());
-        assert_eq!(cache.get("m", "pkg-a", "a"), Some("SAFE"));
-        assert_eq!(cache.get("m", "pkg-b", "b"), Some("DANGER"));
+        assert_eq!(cache.get("m", "pkg-a", "a").unwrap().level, Level::Safe);
+        assert_eq!(cache.get("m", "pkg-b", "b").unwrap().level, Level::Danger);
     }
 
     #[test]
@@ -598,21 +627,5 @@ mod tests {
     #[test]
     fn printable_drops_control_chars() {
         assert_eq!(printable("a\x1b[1A\x1b[2Kb\r\nc\x07"), "a[1A[2Kb\nc");
-    }
-
-    // Colors::default() paints nothing, so this only checks no line is mangled.
-    #[test]
-    fn colorize_verdict_keeps_text() {
-        for line in [
-            "DANGER: downloads curl | bash",
-            "CAUTION: source uses HTTP",
-            "SAFE",
-            "The verdict is DANGER here",
-            "danger: something bad",
-            "- Uses eval on network response",
-            "",
-        ] {
-            assert_eq!(colorize_verdict(Colors::default(), line), line);
-        }
     }
 }
