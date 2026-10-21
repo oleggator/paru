@@ -488,8 +488,10 @@ pub struct Config {
     #[default = "bat"]
     pub bat_bin: String,
     pub fm: Option<String>,
-    pub groq_api_key: Option<String>,
-    pub gemini_api_key: Option<String>,
+    #[default = "https://api.openai.com/v1"]
+    pub llm_api_url: String,
+    pub llm_api_key: Option<String>,
+    pub llm_model: Option<String>,
     pub sudo_loop: Vec<String>,
 
     pub mflags: Vec<String>,
@@ -1027,8 +1029,9 @@ then initialise it with:
             "FileManagerFlags" => self.fm_flags.extend(split),
             "ChrootFlags" => self.chroot_flags.extend(split),
             "PreBuildCommand" => self.pre_build_command = Some(value),
-            "GroqApiKey" => self.groq_api_key = Some(value),
-            "GeminiApiKey" => self.gemini_api_key = Some(value),
+            "LlmApiUrl" => self.llm_api_url = value,
+            "LlmApiKey" => self.llm_api_key = Some(value),
+            "LlmModel" => self.llm_model = Some(value),
             _ => eprintln!(
                 "{}",
                 tr!("error: unknown option '{}' in section [bin]", key)

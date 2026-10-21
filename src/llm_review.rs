@@ -7,8 +7,7 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use reqwest::blocking::{Client, RequestBuilder};
-use serde::de::DeserializeOwned;
+use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use tr::tr;
 
@@ -42,15 +41,15 @@ impl LlmCache {
         Self { path, data }
     }
 
-    fn get(&self, provider: &str, pkg: &str, hash: &str) -> Option<&str> {
+    fn get(&self, model: &str, pkg: &str, hash: &str) -> Option<&str> {
         self.data
-            .get(&format!("{}:{}:{}", provider, pkg, hash))
+            .get(&format!("{}:{}:{}", model, pkg, hash))
             .map(|s| s.as_str())
     }
 
-    fn insert(&mut self, provider: &str, pkg: &str, hash: &str, result: String) {
+    fn insert(&mut self, model: &str, pkg: &str, hash: &str, result: String) {
         self.data
-            .insert(format!("{}:{}:{}", provider, pkg, hash), result);
+            .insert(format!("{}:{}:{}", model, pkg, hash), result);
     }
 
     fn save(&self) {
@@ -111,38 +110,12 @@ fn build_prompt(pkgs: &[(&str, &Path)]) -> Result<String> {
     Ok(prompt)
 }
 
-fn post_json<T: DeserializeOwned>(
-    req: RequestBuilder,
-    body: &impl Serialize,
-    api: &str,
-) -> Result<T> {
-    let response = req
-        .json(body)
-        .send()
-        .with_context(|| format!("failed to contact {} API", api))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().unwrap_or_default();
-        anyhow::bail!("{} API error {}: {}", api, status, body);
-    }
-
-    response
-        .json()
-        .with_context(|| format!("failed to parse {} API response", api))
-}
-
-// --- Groq (OpenAI-compatible) ---
-
-const GROQ_API_URL: &str = "https://api.groq.com/openai/v1/chat/completions";
-const GROQ_MODEL: &str = "llama-3.3-70b-versatile";
+// --- OpenAI-compatible chat completions ---
 
 #[derive(Serialize)]
 struct ChatRequest {
     model: String,
     messages: Vec<ChatMessage>,
-    max_tokens: u32,
-    temperature: f32,
     response_format: serde_json::Value,
 }
 
@@ -162,9 +135,9 @@ struct ChatChoice {
     message: ChatMessage,
 }
 
-fn check_pkgbuilds_groq(api_key: &str, pkgs: &[(&str, &Path)]) -> Result<String> {
+fn check_pkgbuilds(config: &Config, model: &str, pkgs: &[(&str, &Path)]) -> Result<String> {
     let request = ChatRequest {
-        model: GROQ_MODEL.to_string(),
+        model: model.to_string(),
         messages: vec![
             ChatMessage {
                 role: "system".to_string(),
@@ -175,116 +148,41 @@ fn check_pkgbuilds_groq(api_key: &str, pkgs: &[(&str, &Path)]) -> Result<String>
                 content: build_prompt(pkgs)?,
             },
         ],
-        max_tokens: 8192,
-        temperature: 0.1,
         response_format: serde_json::json!({ "type": "json_object" }),
     };
 
-    let req = Client::new().post(GROQ_API_URL).bearer_auth(api_key);
-    let parsed: ChatResponse = post_json(req, &request, "Groq")?;
+    let url = format!(
+        "{}/chat/completions",
+        config.llm_api_url.trim_end_matches('/')
+    );
+    let mut req = Client::new().post(url).json(&request);
+    if let Some(key) = &config.llm_api_key {
+        req = req.bearer_auth(key);
+    }
+    let response = req.send().context("failed to contact LLM API")?;
 
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().unwrap_or_default();
+        anyhow::bail!("LLM API error {}: {}", status, body);
+    }
+
+    let parsed: ChatResponse = response
+        .json()
+        .context("failed to parse LLM API response")?;
     parsed
         .choices
         .into_iter()
         .next()
         .map(|c| c.message.content)
-        .context("empty response from Groq API")
-}
-
-// --- Gemini ---
-
-const GEMINI_API_URL: &str =
-    "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash-lite:generateContent";
-
-#[derive(Serialize)]
-struct GeminiRequest {
-    #[serde(rename = "systemInstruction")]
-    system_instruction: GeminiContent,
-    contents: Vec<GeminiContent>,
-    #[serde(rename = "generationConfig")]
-    generation_config: GeminiGenerationConfig,
-}
-
-#[derive(Serialize)]
-struct GeminiGenerationConfig {
-    #[serde(rename = "maxOutputTokens")]
-    max_output_tokens: u32,
-    temperature: f32,
-    #[serde(rename = "responseMimeType")]
-    response_mime_type: &'static str,
-    #[serde(rename = "responseSchema")]
-    response_schema: serde_json::Value,
-}
-
-#[derive(Serialize, Deserialize)]
-struct GeminiContent {
-    parts: Vec<GeminiPart>,
-}
-
-#[derive(Serialize, Deserialize)]
-struct GeminiPart {
-    text: String,
-}
-
-#[derive(Deserialize)]
-struct GeminiResponse {
-    candidates: Vec<GeminiCandidate>,
-}
-
-#[derive(Deserialize)]
-struct GeminiCandidate {
-    content: GeminiContent,
-}
-
-fn check_pkgbuilds_gemini(api_key: &str, pkgs: &[(&str, &Path)]) -> Result<String> {
-    let request = GeminiRequest {
-        system_instruction: GeminiContent {
-            parts: vec![GeminiPart {
-                text: SYSTEM_PROMPT.to_string(),
-            }],
-        },
-        contents: vec![GeminiContent {
-            parts: vec![GeminiPart {
-                text: build_prompt(pkgs)?,
-            }],
-        }],
-        generation_config: GeminiGenerationConfig {
-            max_output_tokens: 8192,
-            temperature: 0.1,
-            response_mime_type: "application/json",
-            response_schema: serde_json::json!({
-                "type": "OBJECT",
-                "properties": { "packages": { "type": "ARRAY", "items": {
-                    "type": "OBJECT",
-                    "properties": {
-                        "name": { "type": "STRING" },
-                        "verdict": { "type": "STRING", "enum": ["SAFE", "CAUTION", "DANGER"] },
-                        "findings": { "type": "ARRAY", "items": { "type": "STRING" } },
-                    },
-                    "required": ["name", "verdict", "findings"],
-                }}},
-                "required": ["packages"],
-            }),
-        },
-    };
-
-    let req = Client::new()
-        .post(GEMINI_API_URL)
-        .query(&[("key", api_key)]);
-    let parsed: GeminiResponse = post_json(req, &request, "Gemini")?;
-
-    parsed
-        .candidates
-        .into_iter()
-        .next()
-        .and_then(|c| c.content.parts.into_iter().next())
-        .map(|p| p.text)
-        .context("empty response from Gemini API")
+        .context("empty response from LLM API")
 }
 
 pub fn report(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str]) -> Vec<u8> {
-    let has_key = config.groq_api_key.is_some() || config.gemini_api_key.is_some();
-    if !has_key || !ask(config, &tr!("Verify PKGBUILDs with LLM?"), false) {
+    let Some(model) = &config.llm_model else {
+        return Vec::new();
+    };
+    if !ask(config, &tr!("Verify PKGBUILDs with LLM?"), false) {
         return Vec::new();
     }
 
@@ -306,41 +204,32 @@ pub fn report(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str]) -> Vec<u
     let mut cache = LlmCache::load(&config.cache_dir);
     let mut out: Vec<u8> = Vec::new();
 
-    type Check = fn(&str, &[(&str, &Path)]) -> anyhow::Result<String>;
-    let providers: [(&str, &Option<String>, Check); 2] = [
-        ("Groq", &config.groq_api_key, check_pkgbuilds_groq),
-        ("Gemini", &config.gemini_api_key, check_pkgbuilds_gemini),
-    ];
-    for (label, key, call) in providers {
-        let Some(key) = key else { continue };
-        let _ = writeln!(
-            out,
-            "{} {}",
-            c.action.paint("::"),
-            c.bold.paint(format!("{} LLM security check:", label))
-        );
-        let id = label.to_lowercase();
-        llm_run_check(&id, key, &pkg_paths, &mut cache, c, &mut out, call);
-    }
+    let _ = writeln!(
+        out,
+        "{} {}",
+        c.action.paint("::"),
+        c.bold.paint(format!("LLM security check ({}):", model))
+    );
+    llm_run_check(config, model, &pkg_paths, &mut cache, c, &mut out);
 
     cache.save();
     out
 }
 
+/// Verdicts are cached per model, so switching models re-reviews.
 fn llm_run_check(
-    provider: &str,
-    key: &str,
+    config: &Config,
+    model: &str,
     pkg_paths: &[(&str, PathBuf, String)],
     cache: &mut LlmCache,
     c: Colors,
     out: &mut impl Write,
-    call: impl Fn(&str, &[(&str, &Path)]) -> anyhow::Result<String>,
 ) {
     let mut results: HashMap<String, (String, bool)> = HashMap::new();
     let mut uncached: Vec<(&str, &Path)> = Vec::new();
 
     for (pkg, path, hash) in pkg_paths {
-        match cache.get(provider, pkg, hash) {
+        match cache.get(model, pkg, hash) {
             Some(hit) => {
                 results.insert(pkg.to_string(), (hit.to_string(), true));
             }
@@ -349,12 +238,13 @@ fn llm_run_check(
     }
 
     if !uncached.is_empty() {
-        match tokio::task::block_in_place(|| call(key, &uncached)).and_then(|r| parse_response(&r))
+        match tokio::task::block_in_place(|| check_pkgbuilds(config, model, &uncached))
+            .and_then(|r| parse_response(&r))
         {
             Ok(parsed) => {
                 for (pkg, _, hash) in pkg_paths {
                     if let Some(result) = parsed.get(*pkg) {
-                        cache.insert(provider, pkg, hash, result.clone());
+                        cache.insert(model, pkg, hash, result.clone());
                         results.insert(pkg.to_string(), (result.clone(), false));
                     }
                 }
@@ -446,24 +336,24 @@ mod tests {
     fn cache_round_trip() {
         let dir = tmp();
         let mut cache = LlmCache::load(dir.path());
-        assert!(cache.get("gemini", "pkg", "h1").is_none());
-        cache.insert("gemini", "pkg", "h1", "SAFE".to_string());
-        cache.insert("gemini", "pkg", "h1", "DANGER\n- curl | bash".to_string());
+        assert!(cache.get("model-a", "pkg", "h1").is_none());
+        cache.insert("model-a", "pkg", "h1", "SAFE".to_string());
+        cache.insert("model-a", "pkg", "h1", "DANGER\n- curl | bash".to_string());
         cache.save();
 
         let cache = LlmCache::load(dir.path());
         assert_eq!(
-            cache.get("gemini", "pkg", "h1"),
+            cache.get("model-a", "pkg", "h1"),
             Some("DANGER\n- curl | bash")
         );
-        // a changed PKGBUILD or another provider must not reuse the verdict
-        assert!(cache.get("gemini", "pkg", "h2").is_none());
-        assert!(cache.get("groq", "pkg", "h1").is_none());
+        // a changed PKGBUILD or another model must not reuse the verdict
+        assert!(cache.get("model-a", "pkg", "h2").is_none());
+        assert!(cache.get("model-b", "pkg", "h1").is_none());
 
         // a corrupt file falls back to an empty cache
         fs::write(dir.path().join("llm-review.json"), "not json").unwrap();
         assert!(LlmCache::load(dir.path())
-            .get("gemini", "pkg", "h1")
+            .get("model-a", "pkg", "h1")
             .is_none());
     }
 
