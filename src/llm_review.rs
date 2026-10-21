@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
@@ -331,73 +332,55 @@ fn check_pkgbuilds(config: &Config, model: &str, pkgs: &[(&str, &str)]) -> Resul
         .context(tr!("empty response from LLM API"))
 }
 
-pub fn report(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str]) -> Vec<u8> {
-    let Some(model) = &config.llm_model else {
-        return Vec::new();
-    };
+/// Verdicts for one review: a summary goes at the top of the review and a
+/// note under each package's header, next to its diff.
+pub struct LlmReport {
+    model: String,
+    pkgs: Vec<String>,
+    verdicts: HashMap<String, Verdict>,
+    /// already printable
+    warnings: Vec<String>,
+}
+
+/// None when no model is configured or the user declines. Verdicts are cached
+/// per API URL and model, so switching either re-reviews.
+pub fn check(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str]) -> Option<LlmReport> {
+    let model = config.llm_model.as_ref()?;
     if !ask(config, &tr!("Verify PKGBUILDs with LLM?"), false) {
-        return Vec::new();
+        return None;
     }
 
-    let c = config.color;
-    let mut out: Vec<u8> = Vec::new();
-
-    let _ = writeln!(
-        out,
-        "{} {}",
-        c.action.paint("::"),
-        c.bold
-            .paint(tr!("LLM security check ({model}):", model = model))
-    );
+    let mut report = LlmReport {
+        model: model.clone(),
+        pkgs: pkgs.iter().map(|p| p.to_string()).collect(),
+        verdicts: HashMap::new(),
+        warnings: Vec::new(),
+    };
 
     // read once: what is cached is exactly what the LLM sees
     let mut pkg_contents: Vec<(&str, String)> = Vec::new();
     for &pkg in pkgs {
         match read_pkg(fetch, pkg) {
             Ok(content) => pkg_contents.push((pkg, content)),
-            Err(e) => {
-                let _ = writeln!(
-                    out,
-                    "  {} {}",
-                    c.warning.paint(tr!("warning:")),
-                    tr!(
-                        "{pkg}: not checked: {err}",
-                        pkg = pkg,
-                        err = printable(&format!("{:#}", e))
-                    )
-                );
-            }
+            Err(e) => report.warnings.push(tr!(
+                "{pkg}: not checked: {err}",
+                pkg = pkg,
+                err = printable(&format!("{:#}", e))
+            )),
         }
     }
 
-    let mut cache = LlmCache::load(&config.cache_dir);
-    llm_run_check(config, model, &pkg_contents, &mut cache, c, &mut out);
-
-    cache.save();
-    out
-}
-
-/// Verdicts are cached per API URL and model, so switching either re-reviews.
-fn llm_run_check(
-    config: &Config,
-    model: &str,
-    pkg_contents: &[(&str, String)],
-    cache: &mut LlmCache,
-    c: Colors,
-    out: &mut impl Write,
-) {
     let provider = format!("{} {}", config.llm_api_url, model);
-    let mut results: HashMap<String, Verdict> = HashMap::new();
+    let mut cache = LlmCache::load(&config.cache_dir);
     let mut uncached: Vec<(&str, &str)> = Vec::new();
-
-    for (pkg, content) in pkg_contents {
+    for (pkg, content) in &pkg_contents {
         match cache.get(&provider, pkg, content) {
             Some(hit) => {
                 let hit = Verdict {
                     cached: true,
                     ..hit.clone()
                 };
-                results.insert(pkg.to_string(), hit);
+                report.verdicts.insert(pkg.to_string(), hit);
             }
             None => uncached.push((pkg, content)),
         }
@@ -407,60 +390,83 @@ fn llm_run_check(
         match tokio::task::block_in_place(|| check_pkgbuilds(config, model, &uncached))
             .and_then(|r| parse_response(&r))
         {
+            // only packages in the prompt: a PKGBUILD could inject verdicts for others
             Ok(parsed) => {
-                for (pkg, content) in pkg_contents {
-                    // cached ones were not sent: a PKGBUILD could inject verdicts for them
-                    if results.contains_key(*pkg) {
-                        continue;
-                    }
-                    if let Some(result) = parsed.get(*pkg) {
-                        cache.insert(&provider, pkg, content, result.clone());
-                        results.insert(pkg.to_string(), result.clone());
+                for (pkg, content) in uncached {
+                    if let Some(verdict) = parsed.get(pkg) {
+                        cache.insert(&provider, pkg, content, verdict.clone());
+                        report.verdicts.insert(pkg.to_string(), verdict.clone());
                     }
                 }
             }
-            // written into the report: stderr is hidden behind the pager
-            Err(e) => {
-                let _ = writeln!(
-                    out,
-                    "  {} {}",
-                    c.warning.paint(tr!("warning:")),
-                    tr!("check failed: {err}", err = printable(&format!("{:#}", e)))
-                );
-            }
+            Err(e) => report.warnings.push(tr!(
+                "check failed: {err}",
+                err = printable(&format!("{:#}", e))
+            )),
         }
     }
 
-    for (pkg, _) in pkg_contents {
-        let Some(verdict) = results.get(*pkg) else {
-            let _ = writeln!(
-                out,
-                "  {} {}: {}",
-                c.action.paint("->"),
-                c.bold.paint(*pkg),
-                tr!("no verdict")
-            );
-            continue;
+    cache.save();
+    Some(report)
+}
+
+impl LlmReport {
+    /// One line per package, worst first, then any warnings.
+    pub fn write_summary(&self, out: &mut impl Write, c: Colors) {
+        let _ = writeln!(
+            out,
+            "{} {}",
+            c.action.paint("::"),
+            c.bold
+                .paint(tr!("LLM security check ({model}):", model = self.model))
+        );
+
+        let mut pkgs: Vec<&String> = self.pkgs.iter().collect();
+        pkgs.sort_by_key(|p| Reverse(self.verdicts.get(*p).map(|v| v.level)));
+        let width = pkgs.iter().map(|p| p.len()).max().unwrap_or(0);
+
+        for pkg in pkgs {
+            let name = c.bold.paint(format!("{:<width$}", pkg, width = width));
+            let Some(v) = self.verdicts.get(pkg) else {
+                let _ = writeln!(out, "    {:<7}  {}  {}", "", name, tr!("no verdict"));
+                continue;
+            };
+            let mut detail = Vec::new();
+            if !v.findings.is_empty() {
+                let n = v.findings.len();
+                detail.push(tr!("{n} finding" | "{n} findings" % n));
+            }
+            if v.cached {
+                detail.push(tr!("(cached)"));
+            }
+            let level = v.level.style(c).paint(format!("{:<7}", v.level.word()));
+            let line = format!("    {}  {}  {}", level, name, detail.join(" "));
+            let _ = writeln!(out, "{}", line.trim_end());
+        }
+
+        for warning in &self.warnings {
+            let _ = writeln!(out, "  {} {}", c.warning.paint(tr!("warning:")), warning);
+        }
+        let _ = writeln!(out);
+    }
+
+    /// The verdict and findings, written under the package's `:: pkg` header.
+    pub fn write_pkg(&self, out: &mut impl Write, c: Colors, pkg: &str) {
+        let Some(v) = self.verdicts.get(pkg) else {
+            let _ = writeln!(out, "  LLM: {}", c.warning.paint(tr!("no verdict")));
+            return;
         };
-        let suffix = if verdict.cached {
+        let cached = if v.cached {
             format!(" {}", tr!("(cached)"))
         } else {
             String::new()
         };
-        let _ = writeln!(
-            out,
-            "  {} {}{}:",
-            c.action.paint("->"),
-            c.bold.paint(*pkg),
-            suffix
-        );
-        let level = verdict.level;
-        let _ = writeln!(out, "    {}", level.style(c).paint(level.word()));
-        for finding in &verdict.findings {
-            let _ = writeln!(out, "    - {}", printable(finding));
+        let level = v.level.style(c).paint(v.level.word());
+        let _ = writeln!(out, "  LLM: {}{}", level, cached);
+        for finding in &v.findings {
+            let _ = writeln!(out, "  - {}", printable(finding));
         }
     }
-    let _ = writeln!(out);
 }
 
 /// LLM output, API errors and file names are untrusted: drop escape codes and
@@ -627,5 +633,52 @@ mod tests {
     #[test]
     fn printable_drops_control_chars() {
         assert_eq!(printable("a\x1b[1A\x1b[2Kb\r\nc\x07"), "a[1A[2Kb\nc");
+    }
+
+    // Colors::default() paints nothing, so this checks layout and order.
+    #[test]
+    fn report_renders_summary_worst_first_and_notes() {
+        let mut cached = verdict(Level::Safe, &[]);
+        cached.cached = true;
+        let report = LlmReport {
+            model: "m".to_string(),
+            pkgs: ["ok", "bad-pkg", "gone", "meh"].map(String::from).to_vec(),
+            verdicts: HashMap::from([
+                ("ok".to_string(), cached),
+                (
+                    "bad-pkg".to_string(),
+                    verdict(Level::Danger, &["curl | sh", "http source"]),
+                ),
+                (
+                    "meh".to_string(),
+                    verdict(Level::Caution, &["\x1b[2Kuses eval"]),
+                ),
+            ]),
+            warnings: vec!["check failed: timeout".to_string()],
+        };
+        let c = Colors::default();
+
+        let mut out = Vec::new();
+        report.write_summary(&mut out, c);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            ":: LLM security check (m):
+    DANGER   bad-pkg  2 findings
+    CAUTION  meh      1 finding
+    SAFE     ok       (cached)
+             gone     no verdict
+  warning: check failed: timeout
+
+"
+        );
+
+        let mut out = Vec::new();
+        report.write_pkg(&mut out, c, "meh");
+        report.write_pkg(&mut out, c, "ok");
+        report.write_pkg(&mut out, c, "gone");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "  LLM: CAUTION\n  - [2Kuses eval\n  LLM: SAFE (cached)\n  LLM: no verdict\n"
+        );
     }
 }
