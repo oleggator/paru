@@ -159,7 +159,7 @@ fn check_pkgbuilds(config: &Config, model: &str, pkgs: &[(&str, &Path)]) -> Resu
     let client = Client::builder().timeout(None).build()?;
     let mut req = client.post(url).json(&request);
     if let Some(key) = &config.llm_api_key {
-        req = req.bearer_auth(key);
+        req = req.bearer_auth(&key.0);
     }
     let response = req.send().context("failed to contact LLM API")?;
 
