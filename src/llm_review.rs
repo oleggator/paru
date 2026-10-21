@@ -155,7 +155,9 @@ fn check_pkgbuilds(config: &Config, model: &str, pkgs: &[(&str, &Path)]) -> Resu
         "{}/chat/completions",
         config.llm_api_url.trim_end_matches('/')
     );
-    let mut req = Client::new().post(url).json(&request);
+    // the blocking default of 30s is too short for reasoning or local models
+    let client = Client::builder().timeout(None).build()?;
+    let mut req = client.post(url).json(&request);
     if let Some(key) = &config.llm_api_key {
         req = req.bearer_auth(key);
     }
