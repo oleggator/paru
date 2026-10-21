@@ -431,6 +431,12 @@ pub fn check(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str]) -> Option
 }
 
 impl LlmReport {
+    /// Nothing got a verdict and a warning says why: rows or notes of
+    /// "no verdict" would only repeat it.
+    fn failed(&self) -> bool {
+        self.verdicts.is_empty() && !self.warnings.is_empty()
+    }
+
     /// One line per package, worst first, then any warnings.
     pub fn write_summary(&self, out: &mut impl Write, c: Colors) {
         let _ = writeln!(
@@ -441,27 +447,30 @@ impl LlmReport {
                 .paint(tr!("LLM security check ({model}):", model = self.model))
         );
 
-        let mut pkgs: Vec<&String> = self.pkgs.iter().collect();
-        pkgs.sort_by_key(|p| Reverse(self.verdicts.get(*p).map(|v| v.level)));
-        let width = pkgs.iter().map(|p| p.len()).max().unwrap_or(0);
+        if !self.failed() {
+            let mut pkgs: Vec<&String> = self.pkgs.iter().collect();
+            pkgs.sort_by_key(|p| Reverse(self.verdicts.get(*p).map(|v| v.level)));
+            let width = pkgs.iter().map(|p| p.len()).max().unwrap_or(0);
 
-        for pkg in pkgs {
-            let name = c.bold.paint(format!("{:<width$}", pkg, width = width));
-            let Some(v) = self.verdicts.get(pkg) else {
-                let _ = writeln!(out, "    {:<7}  {}  {}", "", name, tr!("no verdict"));
-                continue;
-            };
-            let mut detail = Vec::new();
-            if !v.findings.is_empty() {
-                let n = v.findings.len();
-                detail.push(tr!("{n} finding" | "{n} findings" % n));
+            for pkg in pkgs {
+                let name = c.bold.paint(format!("{:<width$}", pkg, width = width));
+                let Some(v) = self.verdicts.get(pkg) else {
+                    let unknown = c.warning.paint(format!("{:<7}", "?"));
+                    let _ = writeln!(out, "    {}  {}  {}", unknown, name, tr!("no verdict"));
+                    continue;
+                };
+                let mut detail = Vec::new();
+                if !v.findings.is_empty() {
+                    let n = v.findings.len();
+                    detail.push(tr!("{n} finding" | "{n} findings" % n));
+                }
+                if v.cached {
+                    detail.push(tr!("(cached)"));
+                }
+                let level = v.level.style(c).paint(format!("{:<7}", v.level.word()));
+                let line = format!("    {}  {}  {}", level, name, detail.join(" "));
+                let _ = writeln!(out, "{}", line.trim_end());
             }
-            if v.cached {
-                detail.push(tr!("(cached)"));
-            }
-            let level = v.level.style(c).paint(format!("{:<7}", v.level.word()));
-            let line = format!("    {}  {}  {}", level, name, detail.join(" "));
-            let _ = writeln!(out, "{}", line.trim_end());
         }
 
         for warning in &self.warnings {
@@ -473,7 +482,9 @@ impl LlmReport {
     /// The verdict and findings, written under the package's `:: pkg` header.
     pub fn write_pkg(&self, out: &mut impl Write, c: Colors, pkg: &str) {
         let Some(v) = self.verdicts.get(pkg) else {
-            let _ = writeln!(out, "  LLM: {}", c.warning.paint(tr!("no verdict")));
+            if !self.failed() {
+                let _ = writeln!(out, "  LLM: {}", c.warning.paint(tr!("no verdict")));
+            }
             return;
         };
         let cached = if v.cached {
@@ -686,7 +697,7 @@ mod tests {
     DANGER   bad-pkg  2 findings
     CAUTION  meh      1 finding
     SAFE     ok       (cached)
-             gone     no verdict
+    ?        gone     no verdict
   warning: check failed: timeout
 
 "
@@ -699,6 +710,19 @@ mod tests {
         assert_eq!(
             String::from_utf8(out).unwrap(),
             "  LLM: CAUTION\n  - [2Kuses eval\n  LLM: SAFE (cached)\n  LLM: no verdict\n"
+        );
+
+        // a failed check shows its warning once, with no rows or notes
+        let failed = LlmReport {
+            verdicts: HashMap::new(),
+            ..report
+        };
+        let mut out = Vec::new();
+        failed.write_summary(&mut out, c);
+        failed.write_pkg(&mut out, c, "gone");
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            ":: LLM security check (m):\n  warning: check failed: timeout\n\n"
         );
     }
 
