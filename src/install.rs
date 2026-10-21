@@ -1715,8 +1715,15 @@ pub fn review(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str]) -> Resul
     }
     if !config.no_confirm {
         if let Some(ref fm) = config.fm {
-            let verdict = llm_review::report(config, fetch, pkgs);
-            let _ = std::io::stdout().write_all(&verdict);
+            if let Some(llm) = llm_review::check(config, fetch, pkgs) {
+                let mut out = std::io::stdout().lock();
+                llm.write_summary(&mut out, c);
+                for &pkg in pkgs {
+                    let _ = writeln!(out, "{} {}:", c.action.paint("::"), c.bold.paint(pkg));
+                    llm.write_pkg(&mut out, c, pkg);
+                }
+                let _ = writeln!(out);
+            }
 
             let _view = file_manager(config, fetch, fm, pkgs)?;
 
@@ -1734,7 +1741,8 @@ pub fn review(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str]) -> Resul
             let diffs = fetch.diff(&has_diff, config.color.enabled)?;
 
             if printed {
-                let verdict = llm_review::report(config, fetch, pkgs);
+                // only what is shown: seen packages without a diff are not in the pager
+                let llm = llm_review::check(config, fetch, &unseen);
 
                 let pager_unconfigured = var("PARU_PAGER").is_err() && var("PAGER").is_err();
                 let pager = if has_command("less") { "less" } else { "cat" };
@@ -1767,15 +1775,16 @@ pub fn review(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str]) -> Resul
                     let _ = stdin.write_all(b"\n\n");
                 }
 
-                let _ = stdin.write_all(&verdict);
+                if let Some(llm) = &llm {
+                    llm.write_summary(&mut stdin, c);
+                }
 
                 for (&pkg, diff) in has_diff.iter().zip(diffs) {
-                    let _ = write!(
-                        stdin,
-                        "{} {}:\n    ",
-                        c.action.paint("::"),
-                        c.bold.paint(pkg)
-                    );
+                    let _ = writeln!(stdin, "{} {}:", c.action.paint("::"), c.bold.paint(pkg));
+                    if let Some(llm) = &llm {
+                        llm.write_pkg(&mut stdin, c, pkg);
+                    }
+                    let _ = write!(stdin, "    ");
                     let _ = stdin.write_all(diff.replace('\n', "\n    ").trim_end().as_bytes());
                     let _ = stdin.write_all(b"\n\n");
                 }
@@ -1787,6 +1796,9 @@ pub fn review(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str]) -> Resul
                     if !has_diff.contains(&pkg) {
                         let dir = fetch.clone_dir.join(pkg);
                         let _ = writeln!(stdin, "{} {}:", c.action.paint("::"), c.bold.paint(pkg));
+                        if let Some(llm) = &llm {
+                            llm.write_pkg(&mut stdin, c, pkg);
+                        }
                         print_dir(config, &dir, &dir, &mut stdin, &mut buf, bat, 1)?;
                     }
                 }
