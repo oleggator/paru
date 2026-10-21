@@ -59,7 +59,7 @@ See [CONTRIBUTING.md](./CONTRIBUTING.md).
   [bin]
   LlmApiUrl = https://api.groq.com/openai/v1
   LlmApiKey = gsk_...
-  LlmModel = llama-3.3-70b-versatile
+  LlmModel = openai/gpt-oss-120b
 
   # Ollama (local, no key)
   [bin]

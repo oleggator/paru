@@ -83,18 +83,25 @@ struct PkgReport {
 fn parse_response(response: &str) -> Result<HashMap<String, String>> {
     let report: Report =
         serde_json::from_str(response.trim()).context("LLM returned malformed JSON")?;
-    Ok(report
+    report
         .packages
         .into_iter()
         .map(|p| {
+            // servers that ignore the schema can return anything
+            anyhow::ensure!(
+                matches!(p.verdict.as_str(), "SAFE" | "CAUTION" | "DANGER"),
+                "LLM returned unknown verdict {:?} for {}",
+                p.verdict,
+                p.name
+            );
             let mut text = p.verdict;
             for f in p.findings {
                 text.push_str("\n- ");
                 text.push_str(&f);
             }
-            (p.name, text)
+            Ok((p.name, text))
         })
-        .collect())
+        .collect()
 }
 
 // --- Shared ---
@@ -179,7 +186,28 @@ fn check_pkgbuilds(config: &Config, model: &str, pkgs: &[(&str, &str)]) -> Resul
                 content: build_prompt(pkgs),
             },
         ],
-        response_format: serde_json::json!({ "type": "json_object" }),
+        response_format: serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "report",
+                "strict": true,
+                "schema": {
+                    "type": "object",
+                    "properties": { "packages": { "type": "array", "items": {
+                        "type": "object",
+                        "properties": {
+                            "name": { "type": "string" },
+                            "verdict": { "type": "string", "enum": ["SAFE", "CAUTION", "DANGER"] },
+                            "findings": { "type": "array", "items": { "type": "string" } },
+                        },
+                        "required": ["name", "verdict", "findings"],
+                        "additionalProperties": false,
+                    }}},
+                    "required": ["packages"],
+                    "additionalProperties": false,
+                },
+            },
+        }),
     };
 
     let url = format!(
@@ -364,6 +392,9 @@ mod tests {
     fn parse_response_rejects_malformed_json() {
         assert!(parse_response(r#"{"packages": [{"name": "pkg", "verd"#).is_err());
         assert!(parse_response("=== pkg ===\nSAFE").is_err());
+        assert!(
+            parse_response(r#"{"packages": [{"name": "pkg", "verdict": "Low risk"}]}"#).is_err()
+        );
     }
 
     #[test]
