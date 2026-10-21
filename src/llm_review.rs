@@ -1,10 +1,7 @@
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::fs;
-use std::hash::{Hash, Hasher};
 use std::io::Write;
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use reqwest::blocking::Client;
@@ -26,9 +23,12 @@ Use an empty findings list if nothing is suspicious.";
 
 // --- Cache ---
 
+/// "model:pkg" -> (content sent to the LLM, verdict). Comparing the full
+/// content instead of a hash means a crafted PKGBUILD can't collide with a
+/// cached SAFE one, and only the latest version of each package is kept.
 struct LlmCache {
     path: PathBuf,
-    data: HashMap<String, String>,
+    data: HashMap<String, (String, String)>,
 }
 
 impl LlmCache {
@@ -41,15 +41,16 @@ impl LlmCache {
         Self { path, data }
     }
 
-    fn get(&self, model: &str, pkg: &str, hash: &str) -> Option<&str> {
+    fn get(&self, model: &str, pkg: &str, content: &str) -> Option<&str> {
         self.data
-            .get(&format!("{}:{}:{}", model, pkg, hash))
-            .map(|s| s.as_str())
+            .get(&format!("{}:{}", model, pkg))
+            .filter(|(cached, _)| cached == content)
+            .map(|(_, verdict)| verdict.as_str())
     }
 
-    fn insert(&mut self, model: &str, pkg: &str, hash: &str, result: String) {
+    fn insert(&mut self, model: &str, pkg: &str, content: &str, verdict: String) {
         self.data
-            .insert(format!("{}:{}:{}", model, pkg, hash), result);
+            .insert(format!("{}:{}", model, pkg), (content.to_string(), verdict));
     }
 
     fn save(&self) {
@@ -57,14 +58,6 @@ impl LlmCache {
             let _ = fs::write(&self.path, json);
         }
     }
-}
-
-/// Cache key: the PKGBUILD text is exactly what the LLM sees.
-// ponytail: DefaultHasher may change between Rust releases, costing one cache miss
-fn content_hash(path: &Path) -> Option<String> {
-    let mut hasher = DefaultHasher::new();
-    fs::read(path).ok()?.hash(&mut hasher);
-    Some(format!("{:016x}", hasher.finish()))
 }
 
 #[derive(Deserialize)]
@@ -100,14 +93,12 @@ fn parse_response(response: &str) -> Result<HashMap<String, String>> {
 
 // --- Shared ---
 
-fn build_prompt(pkgs: &[(&str, &Path)]) -> Result<String> {
+fn build_prompt(pkgs: &[(&str, &str)]) -> String {
     let mut prompt = String::new();
-    for &(name, path) in pkgs {
-        let content = fs::read_to_string(path)
-            .with_context(|| format!("failed to read {}", path.display()))?;
+    for &(name, content) in pkgs {
         prompt.push_str(&format!("=== {} ===\n```\n{}\n```\n\n", name, content));
     }
-    Ok(prompt)
+    prompt
 }
 
 // --- OpenAI-compatible chat completions ---
@@ -135,7 +126,7 @@ struct ChatChoice {
     message: ChatMessage,
 }
 
-fn check_pkgbuilds(config: &Config, model: &str, pkgs: &[(&str, &Path)]) -> Result<String> {
+fn check_pkgbuilds(config: &Config, model: &str, pkgs: &[(&str, &str)]) -> Result<String> {
     let request = ChatRequest {
         model: model.to_string(),
         messages: vec![
@@ -145,7 +136,7 @@ fn check_pkgbuilds(config: &Config, model: &str, pkgs: &[(&str, &Path)]) -> Resu
             },
             ChatMessage {
                 role: "user".to_string(),
-                content: build_prompt(pkgs)?,
+                content: build_prompt(pkgs),
             },
         ],
         response_format: serde_json::json!({ "type": "json_object" }),
@@ -190,16 +181,16 @@ pub fn report(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str]) -> Vec<u
 
     let c = config.color;
 
-    let pkg_paths: Vec<(&str, PathBuf, String)> = pkgs
+    // read once: what is cached is exactly what the LLM sees
+    let pkg_contents: Vec<(&str, String)> = pkgs
         .iter()
         .filter_map(|&pkg| {
-            let path = fetch.clone_dir.join(pkg).join("PKGBUILD");
-            let hash = content_hash(&path)?;
-            Some((pkg, path, hash))
+            let bytes = fs::read(fetch.clone_dir.join(pkg).join("PKGBUILD")).ok()?;
+            Some((pkg, String::from_utf8_lossy(&bytes).into_owned()))
         })
         .collect();
 
-    if pkg_paths.is_empty() {
+    if pkg_contents.is_empty() {
         return Vec::new();
     }
 
@@ -212,7 +203,7 @@ pub fn report(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str]) -> Vec<u
         c.action.paint("::"),
         c.bold.paint(format!("LLM security check ({}):", model))
     );
-    llm_run_check(config, model, &pkg_paths, &mut cache, c, &mut out);
+    llm_run_check(config, model, &pkg_contents, &mut cache, c, &mut out);
 
     cache.save();
     out
@@ -222,20 +213,20 @@ pub fn report(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str]) -> Vec<u
 fn llm_run_check(
     config: &Config,
     model: &str,
-    pkg_paths: &[(&str, PathBuf, String)],
+    pkg_contents: &[(&str, String)],
     cache: &mut LlmCache,
     c: Colors,
     out: &mut impl Write,
 ) {
     let mut results: HashMap<String, (String, bool)> = HashMap::new();
-    let mut uncached: Vec<(&str, &Path)> = Vec::new();
+    let mut uncached: Vec<(&str, &str)> = Vec::new();
 
-    for (pkg, path, hash) in pkg_paths {
-        match cache.get(model, pkg, hash) {
+    for (pkg, content) in pkg_contents {
+        match cache.get(model, pkg, content) {
             Some(hit) => {
                 results.insert(pkg.to_string(), (hit.to_string(), true));
             }
-            None => uncached.push((pkg, path)),
+            None => uncached.push((pkg, content)),
         }
     }
 
@@ -244,13 +235,13 @@ fn llm_run_check(
             .and_then(|r| parse_response(&r))
         {
             Ok(parsed) => {
-                for (pkg, _, hash) in pkg_paths {
+                for (pkg, content) in pkg_contents {
                     // cached ones were not sent: a PKGBUILD could inject verdicts for them
                     if results.contains_key(*pkg) {
                         continue;
                     }
                     if let Some(result) = parsed.get(*pkg) {
-                        cache.insert(model, pkg, hash, result.clone());
+                        cache.insert(model, pkg, content, result.clone());
                         results.insert(pkg.to_string(), (result.clone(), false));
                     }
                 }
@@ -267,7 +258,7 @@ fn llm_run_check(
         }
     }
 
-    for (pkg, _, _) in pkg_paths {
+    for (pkg, _) in pkg_contents {
         let Some((result, cached)) = results.get(*pkg) else {
             let _ = writeln!(
                 out,
@@ -342,40 +333,34 @@ mod tests {
     fn cache_round_trip() {
         let dir = tmp();
         let mut cache = LlmCache::load(dir.path());
-        assert!(cache.get("model-a", "pkg", "h1").is_none());
-        cache.insert("model-a", "pkg", "h1", "SAFE".to_string());
-        cache.insert("model-a", "pkg", "h1", "DANGER\n- curl | bash".to_string());
+        assert!(cache.get("model-a", "pkg", "v1").is_none());
+        cache.insert("model-a", "pkg", "v1", "SAFE".to_string());
+        cache.insert("model-a", "pkg", "v2", "DANGER\n- curl | bash".to_string());
         cache.save();
 
         let cache = LlmCache::load(dir.path());
         assert_eq!(
-            cache.get("model-a", "pkg", "h1"),
+            cache.get("model-a", "pkg", "v2"),
             Some("DANGER\n- curl | bash")
         );
         // a changed PKGBUILD or another model must not reuse the verdict
-        assert!(cache.get("model-a", "pkg", "h2").is_none());
-        assert!(cache.get("model-b", "pkg", "h1").is_none());
+        assert!(cache.get("model-a", "pkg", "v1").is_none());
+        assert!(cache.get("model-b", "pkg", "v2").is_none());
 
         // a corrupt file falls back to an empty cache
         fs::write(dir.path().join("llm-review.json"), "not json").unwrap();
         assert!(LlmCache::load(dir.path())
-            .get("model-a", "pkg", "h1")
+            .get("model-a", "pkg", "v2")
             .is_none());
     }
 
     #[test]
     fn build_prompt_wraps_each_pkgbuild_in_order() {
-        let dir = tmp();
-        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
-        fs::write(&a, "pkgname=alpha").unwrap();
-        fs::write(&b, "pkgname=beta").unwrap();
-
-        let prompt = build_prompt(&[("alpha", a.as_path()), ("beta", b.as_path())]).unwrap();
+        let prompt = build_prompt(&[("alpha", "pkgname=alpha"), ("beta", "pkgname=beta")]);
         assert_eq!(
             prompt,
             "=== alpha ===\n```\npkgname=alpha\n```\n\n=== beta ===\n```\npkgname=beta\n```\n\n"
         );
-        assert!(build_prompt(&[("ghost", Path::new("/nonexistent/PKGBUILD"))]).is_err());
     }
 
     // Colors::default() paints nothing, so this only checks no line is mangled.
