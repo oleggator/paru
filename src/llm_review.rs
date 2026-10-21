@@ -278,10 +278,10 @@ pub fn report(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str]) -> Vec<u
             Err(e) => {
                 let _ = writeln!(
                     out,
-                    "  {} {}: not checked: {:#}",
+                    "  {} {}: not checked: {}",
                     c.warning.paint("warning:"),
                     pkg,
-                    e
+                    printable(&format!("{:#}", e))
                 );
             }
         }
@@ -335,9 +335,9 @@ fn llm_run_check(
             Err(e) => {
                 let _ = writeln!(
                     out,
-                    "  {} check failed: {:#}",
+                    "  {} check failed: {}",
                     c.warning.paint("warning:"),
-                    e
+                    printable(&format!("{:#}", e))
                 );
             }
         }
@@ -362,10 +362,18 @@ fn llm_run_check(
             suffix
         );
         for line in result.lines() {
-            let _ = writeln!(out, "    {}", colorize_verdict(c, line));
+            let _ = writeln!(out, "    {}", colorize_verdict(c, &printable(line)));
         }
     }
     let _ = writeln!(out);
+}
+
+/// LLM output, API errors and file names are untrusted: drop escape codes and
+/// other control characters so they can't redraw the terminal.
+fn printable(s: &str) -> String {
+    s.chars()
+        .filter(|&c| c == '\n' || !c.is_control())
+        .collect()
 }
 
 fn colorize_verdict(c: Colors, line: &str) -> String {
@@ -499,6 +507,11 @@ mod tests {
              --- pkg.install ---\n```\npost_install() { :; }\n```\n"
         );
         assert!(read_pkg(&fetch, "ghost").is_err());
+    }
+
+    #[test]
+    fn printable_drops_control_chars() {
+        assert_eq!(printable("a\x1b[1A\x1b[2Kb\r\nc\x07"), "a[1A[2Kb\nc");
     }
 
     // Colors::default() paints nothing, so this only checks no line is mangled.
