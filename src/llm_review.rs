@@ -317,7 +317,7 @@ fn check_pkgbuilds(config: &Config, model: &str, pkgs: &[(&str, &str)]) -> Resul
         anyhow::bail!(tr!(
             "LLM API error {status}: {body}",
             status = status,
-            body = body
+            body = api_error_message(&body)
         ));
     }
 
@@ -344,6 +344,26 @@ pub struct LlmReport {
 
 /// None when no model is configured or the user declines. Verdicts are cached
 /// per API URL and model, so switching either re-reviews.
+/// The `error.message` of an OpenAI-style error body (Gemini wraps it in an
+/// array), else the body on one line, cut short in case it is an HTML page.
+fn api_error_message(body: &str) -> String {
+    let json: Option<serde_json::Value> = serde_json::from_str(body).ok();
+    let message = json.as_ref().and_then(|v| {
+        let v = v.as_array().and_then(|a| a.first()).unwrap_or(v);
+        v["error"]["message"].as_str()
+    });
+    match message {
+        Some(m) => m.to_string(),
+        None => body
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .chars()
+            .take(300)
+            .collect(),
+    }
+}
+
 pub fn check(config: &Config, fetch: &aur_fetch::Fetch, pkgs: &[&str]) -> Option<LlmReport> {
     let model = config.llm_model.as_ref()?;
     if !ask(config, &tr!("Verify PKGBUILDs with LLM?"), false) {
@@ -680,5 +700,19 @@ mod tests {
             String::from_utf8(out).unwrap(),
             "  LLM: CAUTION\n  - [2Kuses eval\n  LLM: SAFE (cached)\n  LLM: no verdict\n"
         );
+    }
+
+    #[test]
+    fn api_error_message_extracts_message() {
+        let gemini =
+            r#"[{"error": {"code": 503, "message": "high demand", "status": "UNAVAILABLE"}}]"#;
+        let openai = r#"{"error": {"message": "bad key", "type": "invalid_request_error"}}"#;
+        assert_eq!(api_error_message(gemini), "high demand");
+        assert_eq!(api_error_message(openai), "bad key");
+        assert_eq!(
+            api_error_message("<html>\n  <b>502</b>\n</html>"),
+            "<html> <b>502</b> </html>"
+        );
+        assert_eq!(api_error_message(&"x".repeat(1000)).len(), 300);
     }
 }
