@@ -243,6 +243,10 @@ fn llm_run_check(
         {
             Ok(parsed) => {
                 for (pkg, _, hash) in pkg_paths {
+                    // cached ones were not sent: a PKGBUILD could inject verdicts for them
+                    if results.contains_key(*pkg) {
+                        continue;
+                    }
                     if let Some(result) = parsed.get(*pkg) {
                         cache.insert(model, pkg, hash, result.clone());
                         results.insert(pkg.to_string(), (result.clone(), false));
