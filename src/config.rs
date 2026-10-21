@@ -501,6 +501,7 @@ pub struct Config {
     pub llm_api_url: String,
     pub llm_api_key: Option<Secret>,
     pub llm_model: Option<String>,
+    pub llm_temperature: Option<f32>,
     pub sudo_loop: Vec<String>,
 
     pub mflags: Vec<String>,
@@ -1041,6 +1042,7 @@ then initialise it with:
             "LlmApiUrl" => self.llm_api_url = value,
             "LlmApiKey" => self.llm_api_key = Some(Secret(value)),
             "LlmModel" => self.llm_model = Some(value),
+            "LlmTemperature" => self.llm_temperature = Some(value.parse()?),
             _ => eprintln!(
                 "{}",
                 tr!("error: unknown option '{}' in section [bin]", key)
